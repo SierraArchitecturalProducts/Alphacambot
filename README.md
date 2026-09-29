@@ -27,6 +27,8 @@ It exposes **62 tools** covering:
 - **The entire automation API** — beyond the curated tools above, a generic invoke
   layer reaches every method and property the ALPHACAM API exposes (see below)
 
+**[See TOOLS.md](TOOLS.md) for a plain-English reference to every tool**
+
 ## How it works
 
 ```
@@ -199,9 +201,8 @@ adding tools, and a long list of hard-won gotchas.
   of companies. **Node.js** is a trademark of the **OpenJS Foundation**.
 - All other trademarks are the property of their respective owners.
 
-Alphacambot was built by Sierra Hardware Products, Inc., largely in collaboration
-with Claude itself — the bridge was designed, written, and live-tested through the
-very kind of Claude-driven sessions it now enables.
+Alphacambot was built by Sierra Hardware Products, Inc., in collaboration
+with Claude.
 
 ## License
 
