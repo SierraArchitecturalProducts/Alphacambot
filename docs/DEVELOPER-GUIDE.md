@@ -115,7 +115,7 @@ Bridge: alphacam.get_drawing_info
 - `.Save()` / `.SaveAs(path)`
 - `.OutputNC()` / `.ListNC()`
 
-**API reference files** are in the CambotClaude folder: `ACAMAPI.chm`, `AEDITAPI.chm`, `ACAM4.chm`, etc. These contain the full COM API documentation. **Always consult these before writing new handlers.**
+**API reference files** ship with ALPHACAM as help files: `ACAMAPI.chm`, `AEDITAPI.chm`, `ACAM4.chm`, etc. (search your ALPHACAM installation). These contain the full COM API documentation. **Always consult these before writing new handlers.**
 
 To inspect the COM API via PowerShell on the target machine:
 ```powershell
@@ -310,7 +310,7 @@ The MCP server exposes an `alphacam_api_help` tool that queries this reference l
 
 This is the tiered approach: tool descriptions contain enough context for normal use, and `alphacam_api_help` provides deep documentation on demand.
 
-Additional CHM files in CambotClaude (AEDITAPI.chm, ConstraintsAPI.chm, Feature.chm, etc.) cover supplementary APIs not yet parsed.
+Additional CHM files from the ALPHACAM installation (AEDITAPI.chm, ConstraintsAPI.chm, Feature.chm, etc.) cover supplementary APIs not yet parsed.
 
 ## Current Status (as of 2026-07-15 evening)
 
@@ -324,7 +324,7 @@ Additional CHM files in CambotClaude (AEDITAPI.chm, ConstraintsAPI.chm, Feature.
 **Verified end-to-end through Claude Desktop:**
 - File / view: `status`, `new`, `get_drawing_info`, `zoom_all`, `redraw`, `save_as` (.amd/.ard), `save_drawing`, `open_drawing` (round-trip), `import_cad` (DXF), `output_nc` (3-arg COM call; `OutputNCStatus` surfaced), `list_nc`.
 - Geometry: `create_rectangle`, `create_circle`, `create_line`, `create_polygon`, `create_text`, `create_ellipse`, `create_2d_geometry`, `list_geometries` (IUnknown-deduped), `get_geometry_info` (real metadata: layer, elementCount, extents, length, closed).
-- Post / Tool / Machining: `select_post` (default XilogPlus.arb — see caveat under Known Gotchas #22), `list_tools` (**recursive** folder scan as of 2026-07-06 — auto-discovers user subfolders like `Canavan Tools`), `select_tool` (`$USER` for picker), `get_current_tool`, `rough_finish` (operator-level params + full lead-in surface via `Path.SetLeadInOutAuto`; verified with ramped and asymmetric leads; **helical descent verified 2026-07-15** — `helicalPitch` defaults to the current tool's Diameter), `pocket` (closed-boundary area clearance; PocketType contour/linear/spiral; WidthOfCut stepover defaults to 50% of tool diameter — pocket lead-in still uses MillData.LeadData and doesn't visibly produce leads; deferred).
+- Post / Tool / Machining: `select_post` (default XilogPlus.arb — see caveat under Known Gotchas #22), `list_tools` (**recursive** folder scan as of 2026-07-06 — auto-discovers user-created tool subfolders), `select_tool` (`$USER` for picker), `get_current_tool`, `rough_finish` (operator-level params + full lead-in surface via `Path.SetLeadInOutAuto`; verified with ramped and asymmetric leads; **helical descent verified 2026-07-15** — `helicalPitch` defaults to the current tool's Diameter), `pocket` (closed-boundary area clearance; PocketType contour/linear/spiral; WidthOfCut stepover defaults to 50% of tool diameter — pocket lead-in still uses MillData.LeadData and doesn't visibly produce leads; deferred).
 - Material / Direction / Iteration: `specify_panel` (Path.SetPanel + tracks helper geometries), `specify_material` (Path.SetMaterial mirror), `set_material` (Drawing.SelectMaterial for material type), `set_tool_side` (Path.ToolInOut / Path.ToolSide; inside/outside/center/left/right), `reverse_geometry` (Path.Reverse or explicit Path.CW), `set_start_point` (Path.SetStartPoint with rule-based positioning: `middleOfLongestEdge`, corner names, `nearestToPoint`, explicit).
 - Deletion (all landed 2026-07-06): `delete_geometry`, `delete_toolpath` (by id/index/all), `delete_panel`, `delete_material` (target=geo|type). All cascade-delete tracked panel/material auto-helpers via `_designationHelpers`.
 - NC Output: `output_nc` defaults to **unattended mode** — patches XilogPost.ini `[Pratix Z2]` with `DisplayScreen=0` + material dims from last `specify_panel` + fixed zone/vac defaults, runs OutputNC (no operator dialog), then restores `DisplayScreen=1`. INI path derived from `App.PostFileName` directory (dodges the LicomdirPath case-mismatch bug). Set `unattended: false` to keep the classic dialog flow.
