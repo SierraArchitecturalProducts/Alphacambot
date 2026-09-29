@@ -1908,7 +1908,7 @@ namespace CambotAlphacam
                     // window (single picks or a selection window), then
                     // right-clicks/Escape to finish. Blocks until they do.
                     dynamic drw = _app.ActiveDrawing;
-                    var promptText = GetString(prms, "prompt", "Select geometries for Claude, then press Escape");
+                    var promptText = GetString(prms, "prompt", "Select geometries for the agent, then press Escape");
                     dynamic picked = drw.UserSelectMultiGeosCollection(promptText, 0);
                     var ids = StorePathsCollection(picked);
                     return new Dictionary<string, object>
@@ -2162,9 +2162,265 @@ namespace CambotAlphacam
                     };
                 }
 
+                // ════════════════════════════════════════════════════════
+                //  GENERIC FULL-API ACCESS (late-bound COM reflection)
+                //  Anything ALPHACAM's automation API exposes is callable
+                //  through these three commands; the curated handlers above
+                //  remain the safe fast path for common workflows.
+                // ════════════════════════════════════════════════════════
+
+                case "alphacam.api_invoke":
+                {
+                    var target = ResolveApiTarget(GetString(prms, "target", "app"));
+                    var member = GetString(prms, "member", "");
+                    if (string.IsNullOrEmpty(member)) throw new ArgumentException("member is required");
+                    var kind = GetString(prms, "kind", "auto");
+                    var argArr = ConvertApiArgs(prms.ContainsKey("args") ? prms["args"] as System.Collections.ArrayList : null);
+
+                    System.Reflection.BindingFlags flags;
+                    switch (kind)
+                    {
+                        case "get": flags = System.Reflection.BindingFlags.GetProperty; break;
+                        case "set": flags = System.Reflection.BindingFlags.SetProperty; break;
+                        case "method": flags = System.Reflection.BindingFlags.InvokeMethod; break;
+                        case "auto": flags = System.Reflection.BindingFlags.InvokeMethod | System.Reflection.BindingFlags.GetProperty; break;
+                        default: throw new ArgumentException("kind must be auto, method, get or set");
+                    }
+                    if (kind == "set" && argArr.Length == 0)
+                        throw new ArgumentException("kind:\"set\" needs args (the new value; for indexed properties the index args first, value last)");
+
+                    System.Reflection.ParameterModifier[] mods = null;
+                    var byRefList = prms.ContainsKey("byRef") ? prms["byRef"] as System.Collections.ArrayList : null;
+                    if (byRefList != null && byRefList.Count > 0)
+                    {
+                        if (argArr.Length == 0) throw new ArgumentException("byRef given but args is empty");
+                        var pm = new System.Reflection.ParameterModifier(argArr.Length);
+                        foreach (var o in byRefList)
+                        {
+                            var idx = Convert.ToInt32(o);
+                            if (idx < 0 || idx >= argArr.Length) throw new ArgumentException("byRef index " + idx + " out of range");
+                            pm[idx] = true;
+                        }
+                        mods = new[] { pm };
+                    }
+
+                    object ret;
+                    try
+                    {
+                        ret = target.GetType().InvokeMember(member, flags, null, target, argArr, mods, null, null);
+                    }
+                    catch (Exception ex)
+                    {
+                        var inner = (ex is System.Reflection.TargetInvocationException && ex.InnerException != null) ? ex.InnerException : ex;
+                        var com = inner as COMException;
+                        if (com != null && (uint)com.HResult == 0x80020006)
+                            throw new ArgumentException("'" + member + "' is not a member of " + GetComTypeName(target) + ". Check spelling with alphacam_api_help.");
+                        if (com != null && (uint)com.HResult == 0x8002000E)
+                            throw new ArgumentException("'" + member + "' was called with the wrong number of arguments (" + argArr.Length + "). Check the signature with alphacam_api_help.");
+                        if (com != null && ((uint)com.HResult == 0x80020005 || (uint)com.HResult == 0x80020008))
+                            throw new ArgumentException("'" + member + "' argument type mismatch: " + inner.Message + ". Check the signature with alphacam_api_help.");
+                        throw new InvalidOperationException(GetComTypeName(target) + "." + member + " failed: " + inner.Message);
+                    }
+
+                    var res = new Dictionary<string, object> { ["result"] = ConvertApiResult(ret) };
+                    if (mods != null)
+                    {
+                        var outVals = new Dictionary<string, object>();
+                        foreach (var o in byRefList)
+                        {
+                            var idx = Convert.ToInt32(o);
+                            outVals[idx.ToString()] = ConvertApiResult(argArr[idx]);
+                        }
+                        res["byRefValues"] = outVals;
+                    }
+                    return res;
+                }
+
+                case "alphacam.api_inspect":
+                {
+                    var targetStr = GetString(prms, "target", "");
+                    if (string.IsNullOrEmpty(targetStr))
+                    {
+                        // No target: list every live object handle.
+                        var handles = new List<object>();
+                        foreach (var kv in _objectCache)
+                            handles.Add(new Dictionary<string, object> { ["objectId"] = kv.Key, ["comType"] = GetComTypeName(kv.Value) });
+                        return new Dictionary<string, object>
+                        {
+                            ["handleCount"] = handles.Count,
+                            ["handles"] = handles,
+                            ["roots"] = new List<object> { "app", "drawing" }
+                        };
+                    }
+                    var target = ResolveApiTarget(targetStr);
+                    var typeName = GetComTypeName(target);
+                    var d = new Dictionary<string, object> { ["target"] = targetStr, ["comType"] = typeName };
+                    var members = DescribeInteropType(typeName);
+                    if (members != null)
+                    {
+                        d["methods"] = members.Item1;
+                        d["properties"] = members.Item2;
+                    }
+                    d["hint"] = "Use alphacam_api_help for signatures and docs, alphacam_api_invoke to call.";
+                    return d;
+                }
+
+                case "alphacam.api_release":
+                {
+                    if (GetBool(prms, "all", false))
+                    {
+                        var count = _objectCache.Count;
+                        foreach (var id in new List<string>(_objectCache.Keys)) RemoveFromCache(id);
+                        return new Dictionary<string, object> { ["released"] = count };
+                    }
+                    var idsToFree = new List<string>();
+                    if (prms.ContainsKey("objectIds"))
+                    {
+                        var arr = prms["objectIds"] as System.Collections.ArrayList;
+                        if (arr != null) foreach (var o in arr) { var s = Convert.ToString(o); if (!string.IsNullOrEmpty(s)) idsToFree.Add(s); }
+                    }
+                    if (prms.ContainsKey("objectId"))
+                    {
+                        var s = GetString(prms, "objectId", "");
+                        if (!string.IsNullOrEmpty(s)) idsToFree.Add(s);
+                    }
+                    if (idsToFree.Count == 0) throw new ArgumentException("Pass objectId, objectIds, or all:true");
+                    int released = 0;
+                    foreach (var id in idsToFree) { if (_objectCache.ContainsKey(id)) { RemoveFromCache(id); released++; } }
+                    return new Dictionary<string, object> { ["released"] = released };
+                }
+
                 default:
                     throw new InvalidOperationException("Unknown method: " + method);
             }
+        }
+
+        // ── Generic API helpers ─────────────────────────────────────
+
+        // Resolve an api_invoke/api_inspect target: a root name or a cached id.
+        private object ResolveApiTarget(string target)
+        {
+            if (string.IsNullOrEmpty(target)
+                || string.Equals(target, "app", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(target, "application", StringComparison.OrdinalIgnoreCase))
+                return _app;
+            if (string.Equals(target, "drawing", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(target, "activedrawing", StringComparison.OrdinalIgnoreCase))
+            {
+                var drw = _app.ActiveDrawing;
+                if (drw == null) throw new InvalidOperationException("No active drawing");
+                return drw;
+            }
+            if (_objectCache.TryGetValue(target, out var cached)) return cached;
+            throw new ArgumentException("Unknown target '" + target + "'. Use \"app\", \"drawing\", or an objectId/geometryId returned by an earlier call.");
+        }
+
+        // JSON args -> COM-callable object[]. {"$id":"obj_N"} resolves to a
+        // cached COM object; decimals become doubles (ALPHACAM's API wants
+        // VT_R8, and JavaScriptSerializer parses non-integer numbers as decimal).
+        private object[] ConvertApiArgs(System.Collections.ArrayList raw)
+        {
+            if (raw == null) return new object[0];
+            var result = new object[raw.Count];
+            for (int i = 0; i < raw.Count; i++) result[i] = ConvertApiArg(raw[i]);
+            return result;
+        }
+
+        private object ConvertApiArg(object v)
+        {
+            if (v == null) return null;
+            if (v is decimal) return Convert.ToDouble(v);
+            var dict = v as Dictionary<string, object>;
+            if (dict != null)
+            {
+                object idVal;
+                if (dict.TryGetValue("$id", out idVal) || dict.TryGetValue("objectId", out idVal))
+                {
+                    var id = Convert.ToString(idVal);
+                    if (!_objectCache.TryGetValue(id, out var cached))
+                        throw new ArgumentException("Object " + id + " not found in cache");
+                    return cached;
+                }
+                throw new ArgumentException("Object-valued args must be {\"$id\": \"obj_N\"} references");
+            }
+            var list = v as System.Collections.ArrayList;
+            if (list != null)
+            {
+                var arr = new object[list.Count];
+                for (int i = 0; i < list.Count; i++) arr[i] = ConvertApiArg(list[i]);
+                return arr;
+            }
+            return v; // string, bool, int
+        }
+
+        // COM/primitive result -> JSON-safe value. COM objects become
+        // {"objectId","comType"} handles (usable as target / {"$id"} args).
+        private object ConvertApiResult(object v)
+        {
+            if (v == null) return null;
+            if (v is string || v is bool || v is sbyte || v is byte || v is short || v is ushort
+                || v is int || v is uint || v is long || v is ulong
+                || v is float || v is double || v is decimal) return v;
+            if (v is DateTime) return ((DateTime)v).ToString("o");
+            if (v is Enum) return Convert.ToInt32(v);
+            var arr = v as Array;
+            if (arr != null)
+            {
+                var list = new List<object>();
+                foreach (var e in arr) list.Add(ConvertApiResult(e));
+                return list;
+            }
+            if (Marshal.IsComObject(v))
+            {
+                return new Dictionary<string, object>
+                {
+                    ["objectId"] = StoreObject(v),
+                    ["comType"] = GetComTypeName(v)
+                };
+            }
+            return v.ToString();
+        }
+
+        // Runtime type name of a COM object via its ITypeInfo.
+        private string GetComTypeName(object comObj)
+        {
+            if (comObj == null) return "null";
+            try
+            {
+                if (Marshal.IsComObject(comObj))
+                    return Microsoft.VisualBasic.Information.TypeName(comObj);
+            }
+            catch { }
+            try { return comObj.GetType().Name; } catch { return "unknown"; }
+        }
+
+        // Member lists for a COM type, reflected from the interop assembly.
+        // Returns (methods, properties) or null when the type isn't found.
+        private Tuple<List<string>, List<string>> DescribeInteropType(string typeName)
+        {
+            try
+            {
+                var asm = typeof(IAlphaCamApp).Assembly;
+                var t = asm.GetType("AlphaCAMMill." + typeName, false)
+                     ?? asm.GetType("AlphaCAMMill.I" + typeName, false);
+                if (t == null) return null;
+                var seen = new HashSet<string>();
+                var methods = new List<string>();
+                var props = new List<string>();
+                var types = new List<Type> { t };
+                types.AddRange(t.GetInterfaces());
+                foreach (var it in types)
+                {
+                    foreach (var p in it.GetProperties())
+                        if (seen.Add("p:" + p.Name)) props.Add(p.Name);
+                    foreach (var m in it.GetMethods())
+                        if (!m.IsSpecialName && seen.Add("m:" + m.Name)) methods.Add(m.Name);
+                }
+                methods.Sort();
+                props.Sort();
+                return Tuple.Create(methods, props);
+            }
+            catch { return null; }
         }
 
         // Total length of a path by walking its elements.
@@ -2220,7 +2476,7 @@ namespace CambotAlphacam
             if (GetBool(prms, "interactive", false))
             {
                 dynamic drw = _app.ActiveDrawing;
-                var promptText = GetString(prms, "prompt", "Select geometries for Claude, then press Escape");
+                var promptText = GetString(prms, "prompt", "Select geometries for the agent, then press Escape");
                 dynamic picked = drw.UserSelectMultiGeosCollection(promptText, 0);
                 var resultI = new List<KeyValuePair<string, object>>();
                 int pcount = 0;

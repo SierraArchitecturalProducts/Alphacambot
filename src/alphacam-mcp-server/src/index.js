@@ -3,10 +3,13 @@
 /**
  * Alphacam MCP Server
  *
- * Bridges Claude Desktop to Alphacam CAM software via named pipe.
+ * Bridges any MCP client (Claude Desktop, or any other MCP-capable LLM
+ * agent or tool) to ALPHACAM CAM software via named pipe. The server
+ * speaks standard Model Context Protocol over stdio — nothing in it is
+ * client-specific.
  *
  * Architecture:
- *   Claude Desktop <--stdio/MCP--> this server <--named pipe/JSON-RPC--> AlphacamBridge .NET DLL
+ *   MCP client <--stdio/MCP--> this server <--named pipe/JSON-RPC--> AlphacamBridge .NET DLL
  *
  * Usage:
  *   node src/index.js [--pipe AlphacamBridge] [--key anonymous]
@@ -109,6 +112,8 @@ const METHOD_TIMEOUTS = {
   'alphacam.engrave': 5 * 60 * 1000,
   'alphacam.set_tool_side_auto': 5 * 60 * 1000,
   'alphacam.save_part': 5 * 60 * 1000,
+  // Generic API calls can hit interactive members (UserSelect*, dialogs).
+  'alphacam.api_invoke': 5 * 60 * 1000,
 };
 
 /**

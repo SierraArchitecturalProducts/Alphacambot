@@ -4,7 +4,8 @@
 #   1. Checks prerequisites (Node.js, .NET SDK)
 #   2. Copies Interop.AlphaCAMMill.dll from your ALPHACAM install (tools\Get-Interop.ps1)
 #   3. Builds the shim (.NET 4.8) and the Launcher (.NET 8)
-#   4. Installs the MCP server (npm install + Claude Desktop config entry)
+#   4. Installs the MCP server (npm install + Claude Desktop config entry;
+#      any other MCP client uses the same command/args in its own config)
 #   5. Builds the optional API-help index from your own ACAMAPI.chm
 #   6. Deploys the add-in and Launcher (Deploy-Shim.ps1; needs an elevated shell)
 #
@@ -107,5 +108,5 @@ Write-Host "Setup complete." -ForegroundColor Green
 if (-not $deployDone) {
     Write-Host "Remaining: run Deploy-Shim.ps1 from an elevated PowerShell (with ALPHACAM closed)." -ForegroundColor Yellow
 }
-Write-Host "Then: start ALPHACAM (the add-in loads automatically), restart Claude Desktop," -ForegroundColor Gray
-Write-Host "and ask Claude: `"give me alphacam status`"." -ForegroundColor Gray
+Write-Host "Then: start ALPHACAM (the add-in loads automatically), restart your MCP client," -ForegroundColor Gray
+Write-Host "and ask the agent: `"give me alphacam status`"." -ForegroundColor Gray

@@ -16,6 +16,8 @@
   <ItemGroup>
     <!-- Microsoft.CSharp for 'dynamic' keyword support -->
     <Reference Include="Microsoft.CSharp" />
+    <!-- Microsoft.VisualBasic for Information.TypeName (COM runtime type names) -->
+    <Reference Include="Microsoft.VisualBasic" />
     <!-- System.Web.Extensions for JavaScriptSerializer (JSON in .NET 4.8) -->
     <Reference Include="System.Web.Extensions" />
     <!-- System.Windows.Forms for thread marshaling via Control.Invoke -->

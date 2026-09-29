@@ -1,7 +1,7 @@
 {
   "name": "alphacam-mcp-server",
   "version": "1.0.0",
-  "description": "MCP server that bridges Claude Desktop to Alphacam via named pipe",
+  "description": "MCP server exposing Hexagon ALPHACAM automation to any MCP-capable LLM agent",
   "type": "module",
   "main": "src/index.js",
   "bin": {

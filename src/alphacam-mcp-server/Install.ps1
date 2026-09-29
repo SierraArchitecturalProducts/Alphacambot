@@ -1,5 +1,7 @@
 # Install.ps1
-# Installs the Alphacam MCP server into Claude Desktop's configuration.
+# Installs the Alphacam MCP server's dependencies and registers it in
+# Claude Desktop's configuration (if you use a different MCP client, the
+# config it prints at the end carries over: same command, same args).
 # Run from the alphacam-mcp-server directory.
 
 $ErrorActionPreference = "Stop"
@@ -63,4 +65,5 @@ Write-Host "Installed to: $claudeConfigPath" -ForegroundColor Green
 Write-Host "Server path:  $serverPath" -ForegroundColor Green
 Write-Host ""
 Write-Host "Restart Claude Desktop to activate the Alphacam tools." -ForegroundColor Yellow
+Write-Host "(Other MCP clients: register the same command/args in that client's config.)" -ForegroundColor Yellow
 Write-Host "Make sure AlphacamBridge (launcher or Alphacam add-in) is running." -ForegroundColor Yellow

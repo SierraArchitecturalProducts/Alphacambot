@@ -1,17 +1,17 @@
 # AlphacamBridge — Developer Guide
 
-This document contains everything needed to understand, build, deploy, and extend the AlphacamBridge MCP plugin. It is written for an LLM agent (Claude) that may be picking up this project cold.
+This document contains everything needed to understand, build, deploy, and extend the AlphacamBridge MCP plugin. It is written for an LLM agent that may be picking up this project cold.
 
 ---
 
 ## What This Is
 
-AlphacamBridge is an MCP plugin that lets Claude Desktop control Hexagon Alphacam (a Windows CAM application) via its COM automation API. The user issues natural-language commands; Claude calls MCP tools; those tools traverse a multi-layer bridge to invoke COM methods on the running Alphacam instance.
+AlphacamBridge is an MCP server that lets any MCP-capable LLM agent (Claude Desktop, or any other MCP client) control Hexagon Alphacam (a Windows CAM application) via its COM automation API. The user issues natural-language commands; the agent calls MCP tools; those tools traverse a multi-layer bridge to invoke COM methods on the running Alphacam instance.
 
 ## Architecture (Data Flow)
 
 ```
-Claude Desktop
+MCP client (Claude Desktop, or any MCP-capable agent)
   ↕  stdio (MCP protocol)
 Node.js MCP Server  (alphacam-mcp-server/)
   ↕  Named pipe "AlphacamBridge" — JSON-RPC 2.0, 4-byte big-endian length prefix
@@ -70,7 +70,7 @@ The `Tools/` and `ObjectCache/` subfolders were removed 2026-05-29 (only existed
 **.NET 8.** Shared project or additional utilities (check contents as needed).
 
 ### `alphacam-mcp-server/`
-**Node.js.** The MCP server that Claude Desktop talks to.
+**Node.js.** The MCP server that the MCP client talks to. Built on the official `@modelcontextprotocol/sdk`; nothing in it is client-specific (see `src/__tests__/generic-client.test.js`, which drives it with the reference SDK client).
 
 - **src/index.js** — Entry point. Parses `--pipe` and `--key` CLI args. Creates MCP server, connects to the named pipe, registers tools from `tool-definitions.js`.
 - **src/tool-definitions.js** — All MCP tool definitions (name, description, inputSchema). Also exports `toBridgeMethod()`.
@@ -150,7 +150,7 @@ When adding a handler:
 2. Add a `case "alphacam.<name>":` block in `DispatchMethod`.
 3. If the method needs a custom MCP-facing parameter shape, also update `tool-definitions.js` in the Node.js MCP server.
 4. Rebuild shim (Debug, .NET 4.8), run `Deploy-Shim.ps1` (auto-stages the new DLL from `bin\Debug\net48\`), restart Alphacam.
-5. Restart Claude Desktop if you changed `tool-definitions.js` (the Node MCP server pre-validates against the schemas at startup).
+5. Restart your MCP client (e.g. Claude Desktop) if you changed `tool-definitions.js` (the Node MCP server pre-validates against the schemas at startup).
 
 ## Deployment
 
@@ -248,9 +248,9 @@ Located next to `AlphacamBridge.Launcher.exe`. **The file next to the exe takes 
 { "Auth": { "Enabled": false } }
 ```
 
-### Claude Desktop Config
+### MCP Client Config
 
-In `%APPDATA%\Claude\claude_desktop_config.json`, add under `mcpServers`:
+Any MCP client that can spawn a stdio server works. For Claude Desktop, in `%APPDATA%\Claude\claude_desktop_config.json`, add under `mcpServers` (other clients take the same command/args in their own config format):
 ```json
 {
   "alphacam": {
@@ -275,7 +275,7 @@ In `%APPDATA%\Claude\claude_desktop_config.json`, add under `mcpServers`:
 7. **Config file precedence** — File next to Launcher.exe wins over AppData location.
 8. **COM property names** — `.FullName` not `.FileName`, `.GetGeoCount()` not `.GeometryCount`. Always verify against the interop assembly or CHM docs.
 9. **All COM calls must be STA-marshalled** — Always use `_dispatcher.InvokeAsync(...)` in the Launcher, or `Control.Invoke` in the shim's ComCommandServer.
-10. **PowerShell `ConvertTo-Json` can corrupt Claude Desktop's config** — Edit the JSON file directly or use a different tool.
+10. **PowerShell `ConvertTo-Json` can corrupt the MCP client's config (e.g. Claude Desktop's)** — Edit the JSON file directly or use a different tool.
 11. **Alphacam process name is `Acam.exe`** — Not `Mill`, `Lathe`, `Router`, etc. A deploy script that checks for blocking processes by name should look for `Acam`, or better, enumerate `Get-Process | Where { $_.Modules.FileName -like 'C:\Program Files\Hexagon\ALPHACAM*' }` and reject if any are found.
 12. **The shim DLL is locked while loaded.** Even after closing Alphacam, the launching PowerShell session can hold it via `Assembly.LoadFrom`. If a deploy reports "copy silently skipped (size mismatch)", start a fresh PowerShell session and retry.
 13. **`alphacam_status.Connected` is lazy.** It reports the shim-pipe state, which is `false` until the first request triggers a connection. As of 2026-05-29 `status` also reports `Module` (read cross-process via the ROT proxy, doesn't depend on the shim pipe), so the *module letter* is reliable from a fresh start but `Connected` still isn't. For pipe-readiness, call an actual method (e.g. `alphacam_new`).
@@ -284,8 +284,8 @@ In `%APPDATA%\Claude\claude_desktop_config.json`, add under `mcpServers`:
 16. **Cowork mount writes don't always propagate immediately.** A file just written through the mount may still show old content when read directly from Windows seconds later. Verify with `Get-FileHash` or paste a one-liner directly into PowerShell instead of saving to a `.ps1` file when iterating quickly.
 17. **Cowork mount reads can be stale.** `tail` and `ls` over the mount may return cached data. Re-mounting the folder usually helps but isn't always sufficient — `Grep` and `Read` with explicit `offset` can bypass the cache better than `tail`.
 18. **The shim's ComCommandServer uses `JavaScriptSerializer`,** which lives in `System.Web.Extensions.dll`. The reference is added in `AlphacamBridge.Shim.csproj` and resolves correctly under Alphacam's .NET 4.8 AppDomain — verified by `Assembly.LoadFrom` and successful end-to-end circle draw.
-19. **The Launcher pipe is single-client.** `PipeServer` opens with `maxNumberOfServerInstances=1`. Two Claude Desktop sessions targeting the same bridge will fight — the second sees "Connection timeout" or "Socket closed before connection established." Restart Claude Desktop to release the stale connection. To support multiple sessions, bump max instances in `PipeServer.cs` and add per-client session tracking.
-20. **MCP tool-definition edits require a Claude Desktop restart.** The Node MCP server in `alphacam-mcp-server/src/index.js` pre-validates against the JSON schemas at startup. In-flight edits to `tool-definitions.js` don't apply until the server respawns — which means restarting Claude Desktop (it owns the process).
+19. **The Launcher pipe is single-client.** `PipeServer` opens with `maxNumberOfServerInstances=1`. Two MCP client sessions targeting the same bridge will fight — the second sees "Connection timeout" or "Socket closed before connection established." Restart the client to release the stale connection. To support multiple sessions, bump max instances in `PipeServer.cs` and add per-client session tracking.
+20. **MCP tool-definition edits require an MCP client restart.** The Node MCP server in `alphacam-mcp-server/src/index.js` pre-validates against the JSON schemas at startup. In-flight edits to `tool-definitions.js` don't apply until the server respawns — which means restarting the client (e.g. Claude Desktop; it owns the process).
 21. **`Deploy-Shim.ps1` sources the manifest from `deploy\CambotAlphacam.acamaddin`.** It used to do a string-replace from `AlphacamAddinSample\AlphacamAddinSample\bin\Debug\AlphacamAddinSample.acamaddin`. That dependency was removed 2026-05-29 (the sample's build output isn't always present and the swap-then-write step was brittle). The DLL is auto-staged from `bin\Debug\net48\` when newer than `deploy\CambotAlphacam.dll`.
 22. **`App.LicomdirPath` casing on this install does not match the on-disk path.** `App.LicomdirPath` returns `C:\ALPHACAM\` (uppercase), but the actual folder hosting the post processor is `C:\Alphacam\LICOMDAT\...` (mixed case). `Path.Combine` preserves the wrong root and the default `select_post` open fails with `Error Opening Post`. Workaround: pass `fileName` explicitly when calling `alphacam_select_post`. Real fix: case-canonicalize via `Path.GetFullPath` + filesystem probe, or probe `LicomdatPath` as an alternate base. Tracked in HANDOFF.md TODO.
 23. **Cowork mount can present a desynced file view between Edit/Write and bash.** Symptom: the Edit tool reports successful writes and `Read` shows full content, but `wc -l` / `cat` over the bash mount shows an older truncated copy (sometimes with stale mtime). Build against the bash-visible file fails on a mid-block syntax error. Fix that works: `mcp__cowork__allow_cowork_file_delete` to grant delete, then `rm` and re-create the file via a single `cat > file << 'EOF' ... EOF` bash heredoc. After that all three views (bash, Edit-tool, Windows) agree. This came up writing `ComCommandServer.cs` on 2026-05-31.
@@ -301,9 +301,9 @@ In `%APPDATA%\Claude\claude_desktop_config.json`, add under `mcpServers`:
 
 ## API Reference System
 
-The ACAMAPI.chm has been decompiled and parsed into structured JSON at `alphacam-mcp-server/data/acamapi-reference.json`. This covers 57 COM objects, 645 methods, 672 properties, 5 enums, and 44 events.
+The ACAMAPI.chm has been decompiled and parsed into structured JSON at `alphacam-mcp-server/data/acamapi-reference.json`. This covers 57 COM objects, ~648 methods, ~722 properties, 5 enums, and 44 events. It is generated locally from the user's own ACAMAPI.chm by `tools/generate-api-reference.js` (not distributed — it derives from Hexagon's documentation).
 
-The MCP server exposes an `alphacam_api_help` tool that queries this reference locally (no bridge call). Claude can use it to look up:
+The MCP server exposes an `alphacam_api_help` tool that queries this reference locally (no bridge call). The agent can use it to look up:
 - Object overviews: `"Drawing"`, `"MillData"`, `"MillTool"`
 - Specific members: `"Drawing.CreateCircle"`, `"MillData.AutoZ"`
 - Keyword search: `"pocket"`, `"stepover"`, `"lead-in"`
@@ -312,16 +312,28 @@ This is the tiered approach: tool descriptions contain enough context for normal
 
 Additional CHM files from the ALPHACAM installation (AEDITAPI.chm, ConstraintsAPI.chm, Feature.chm, etc.) cover supplementary APIs not yet parsed.
 
+## Generic Full-API Layer
+
+Beyond the curated tools, three tools give 100% coverage of the automation API via late-bound COM (`Type.InvokeMember` → IDispatch) in the shim:
+
+- **`alphacam_api_invoke`** (`alphacam.api_invoke`) — call any method / get or set any property on `"app"`, `"drawing"`, or any cached `obj_N` id. Args pass through as VARIANTs; object-valued args are written `{"$id": "obj_N"}`. `byRef: [indices]` marks VB-style output parameters (via `ParameterModifier`); their post-call values return in `byRefValues`. `kind: "auto"` (default) sends `DISPATCH_METHOD|DISPATCH_PROPERTYGET`, which is the standard late-binding trick for COM servers that mix the two.
+- **`alphacam_api_inspect`** (`alphacam.api_inspect`) — runtime COM type name (via `Microsoft.VisualBasic.Information.TypeName`, i.e. ITypeInfo) plus method/property name lists reflected from the interop assembly. With no target: lists every live handle.
+- **`alphacam_api_release`** (`alphacam.api_release`) — drops cached handles (`RemoveFromCache`), releasing the `GetIUnknownForObject` ref the dedupe map holds.
+
+Returned COM objects are stored through the same `StoreObject` cache the curated tools use, so ids flow freely between the two layers (a `geometryId` from `alphacam_create_circle` is a valid `api_invoke` target and vice versa). Error mapping: `DISP_E_UNKNOWNNAME` → "not a member" hint, `DISP_E_BADPARAMCOUNT`/`TYPEMISMATCH` → signature hint pointing at `alphacam_api_help`.
+
+Discovery loop for the agent: `alphacam_api_help` (docs, signatures, enums) → `alphacam_api_invoke` (execute) → `alphacam_api_inspect` (orient among returned handles).
+
 ## Current Status (as of 2026-07-15 evening)
 
 **Working end-to-end:**
 - Shim loads in Alphacam (after user enables the addin once in Utils > Add-Ins), registers IAlphaCamApp in ROT, launches Launcher.
 - Shim's `ComCommandServer` listens on pipe `AlphacamBridgeCmd` and marshals COM calls to the UI thread via `Control.Invoke`. All `alphacam.*` mutations go through here.
 - Launcher (.NET 8) connects to Alphacam via ROT for read-only ops (`alphacam.status` reads `App.ProgramLetter` for `Module`; `alphacam.diag` exercises read/mutate cross-process). All other dispatch forwards to the shim pipe.
-- Node.js MCP server connects to Launcher pipe `AlphacamBridge`, exposes the tool catalogue to Claude Desktop.
+- Node.js MCP server connects to Launcher pipe `AlphacamBridge`, exposes the tool catalogue to the MCP client.
 - Tool descriptions enriched with ACAMAPI.chm documentation; API reference JSON generated and served by MCP server. `alphacam_api_help` works locally without bridge.
 
-**Verified end-to-end through Claude Desktop:**
+**Verified end-to-end through Claude Desktop (the protocol layer is additionally validated with the reference MCP SDK client in `src/__tests__/generic-client.test.js`, so any MCP client can drive it):**
 - File / view: `status`, `new`, `get_drawing_info`, `zoom_all`, `redraw`, `save_as` (.amd/.ard), `save_drawing`, `open_drawing` (round-trip), `import_cad` (DXF), `output_nc` (3-arg COM call; `OutputNCStatus` surfaced), `list_nc`.
 - Geometry: `create_rectangle`, `create_circle`, `create_line`, `create_polygon`, `create_text`, `create_ellipse`, `create_2d_geometry`, `list_geometries` (IUnknown-deduped), `get_geometry_info` (real metadata: layer, elementCount, extents, length, closed).
 - Post / Tool / Machining: `select_post` (default XilogPlus.arb — see caveat under Known Gotchas #22), `list_tools` (**recursive** folder scan as of 2026-07-06 — auto-discovers user-created tool subfolders), `select_tool` (`$USER` for picker), `get_current_tool`, `rough_finish` (operator-level params + full lead-in surface via `Path.SetLeadInOutAuto`; verified with ramped and asymmetric leads; **helical descent verified 2026-07-15** — `helicalPitch` defaults to the current tool's Diameter), `pocket` (closed-boundary area clearance; PocketType contour/linear/spiral; WidthOfCut stepover defaults to 50% of tool diameter — pocket lead-in still uses MillData.LeadData and doesn't visibly produce leads; deferred).
@@ -338,7 +350,7 @@ Additional CHM files from the ALPHACAM installation (AEDITAPI.chm, ConstraintsAP
 - Pocket lead-in: fixed — pocket now captures the Paths returned by `md.Pocket()` and calls `Path.SetLeadInOutAuto` on each (rough_finish pattern). The old `ApplyLeadDataFromParams`/`MillData.SetLeadData` path was deleted.
 - `select_post` default path: fixed via `ProbeDefaultPostPath()` (probes active-post dir, LicomdirPath, LicomdirPath\LICOMDIR, parent(LicomdatPath)\LICOMDIR; first existing file wins).
 
-`ComCommandServer.DispatchMethod` now has 45 dispatch cases. New helpers: `FindLayerByName`, `ResolveWorkPlane`, `ProbeDefaultPostPath`.
+`ComCommandServer.DispatchMethod` now has 62 dispatch cases (59 curated + the 3 generic API commands). New helpers: `FindLayerByName`, `ResolveWorkPlane`, `ProbeDefaultPostPath`.
 
 **Removed 2026-05-29 (dead code cleanup):**
 - `src\AlphacamBridge.ComInterop\Handlers\` (4 IToolHandler classes) — all dispatch routes through the shim pipe now.
@@ -348,11 +360,11 @@ Additional CHM files from the ALPHACAM installation (AEDITAPI.chm, ConstraintsAP
 - `PathValidator.cs` was kept (small surface, future security work).
 
 **Known constraints:**
-- `PipeServer` is single-client (`NamedPipeServerStream(..., 1, ...)`). Two Claude Desktop sessions against the same bridge will conflict — restart Claude Desktop to release. Fix: bump max instances and add per-client session tracking.
-- MCP tool-definition edits require a Claude Desktop restart to take effect (the Node MCP server pre-validates against schemas at startup).
+- `PipeServer` is single-client (`NamedPipeServerStream(..., 1, ...)`). Two MCP client sessions against the same bridge will conflict — restart the client to release. Fix: bump max instances and add per-client session tracking.
+- MCP tool-definition edits require an MCP client restart to take effect (the Node MCP server pre-validates against schemas at startup).
 
 **TODO:**
-- Deploy the 2026-07-15 evening changes (rebuild on Windows recommended — shim AND launcher, `Deploy-Shim.ps1` + launcher copy, restart Claude Desktop for the tool-definitions.js changes) and live-verify the 10 new handlers + pocket leads + select_post default + orphan-Acam cleanup. Checklist in HANDOFF.md.
+- Live-verify the generic full-API layer (`api_invoke`/`api_inspect`/`api_release`) against a running ALPHACAM after the next deploy (rebuild shim, `Deploy-Shim.ps1`, restart the MCP client).
 - Audit existing shim handlers against ACAMAPI.chm for correct COM property/method names (use `alphacam_api_help` queries).
 - Consider parsing additional CHM files (AEDITAPI, ConstraintsAPI) if those APIs are needed.
 - If multi-session use is wanted, expand the Launcher pipe to multiple instances.

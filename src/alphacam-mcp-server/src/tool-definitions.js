@@ -348,7 +348,7 @@ export const TOOL_DEFINITIONS = [
   {
     name: 'alphacam_select_tool',
     description:
-      'Select a tool for subsequent machining (App.SelectTool). Requires the FULL PATH to a tool file, not just a name. Returns the selected tool\'s actual fileName — if alphacam_list_tools auto-discovery fails on this install, call select_tool with NO fileName (opens the user\'s tool picker), let them pick any tool, and learn the library folder from the returned fileName. WORKFLOW: if you don\'t already have a full path in hand, call alphacam_list_tools FIRST — it recursively scans the Router/Mill library (including user-created subfolders) and returns each tool\'s `path` value ready to hand to this method. Router tool files are .art; Mill are .amt. Pass an empty string or omit fileName to show the user\'s tool picker dialog. Returns the selected tool\'s diameter, number, type, length.',
+      'Select a tool for subsequent machining (App.SelectTool). Requires the FULL PATH to a tool file, not just a name. Returns the selected tool\'s actual fileName — if alphacam_list_tools auto-discovery fails on this install, call select_tool with NO fileName (opens the user\'s tool picker), let them pick any tool, and learn the library folder from the returned fileName. WORKFLOW: if you don\'t already have a full path in hand, call alphacam_list_tools FIRST — it recursively scans the Router/Mill library (including user subfolders like "Canavan Tools") and returns each tool\'s `path` value ready to hand to this method. Router tool files are .art; Mill are .amt. Pass an empty string or omit fileName to show the user\'s tool picker dialog. Returns the selected tool\'s diameter, number, type, length.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -421,7 +421,7 @@ export const TOOL_DEFINITIONS = [
   {
     name: 'alphacam_list_tools',
     description:
-      'List every tool available in the Alphacam tool library. Defaults to a RECURSIVE scan of LicomdatPath\\Rtools.alp (Router) or Mtools.alp (Mill), so user-created subfolders and vendor libraries are included automatically. Returns each tool\'s name, full path, and subfolder (if any). ALWAYS call this at the start of a machining task to see what tools are available before calling alphacam_select_tool — the returned `path` values are what select_tool needs. Pass `folder` explicitly only when overriding the auto-discovered location, or `recursive: false` to restrict to the top level.',
+      'List every tool available in the Alphacam tool library. Defaults to a RECURSIVE scan of LicomdatPath\\Rtools.alp (Router) or Mtools.alp (Mill), so user subfolders (e.g. "Canavan Tools", "Amana", vendor libraries) are included automatically. Returns each tool\'s name, full path, and subfolder (if any). ALWAYS call this at the start of a machining task to see what tools are available before calling alphacam_select_tool — the returned `path` values are what select_tool needs. Pass `folder` explicitly only when overriding the auto-discovered location, or `recursive: false` to restrict to the top level.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -435,7 +435,7 @@ export const TOOL_DEFINITIONS = [
         },
         recursive: {
           type: 'boolean',
-          description: 'Recurse into subfolders. Default true — needed to find user-organized tool subfolders.',
+          description: 'Recurse into subfolders. Default true — needed to find user-organized libraries like "Canavan Tools".',
         },
       },
     },
@@ -1344,6 +1344,81 @@ export const TOOL_DEFINITIONS = [
         subroutines: { type: 'boolean', description: 'Use NC subroutines.' },
       },
       required: ['nestListPath', 'sheets'],
+    },
+  },
+
+  // ════════════════════════════════════════════════════════════════
+  //  GENERIC FULL-API ACCESS
+  //  100% coverage of ALPHACAM's automation API via late-bound COM.
+  //  The curated tools above are the tested fast path; these three
+  //  reach everything else (~650 methods, ~720 properties, 57 objects).
+  // ════════════════════════════════════════════════════════════════
+  {
+    name: 'alphacam_api_invoke',
+    description:
+      'Call ANY method or get/set ANY property in the ALPHACAM automation API — full API coverage beyond the curated tools. ' +
+      'Targets: "app" (the Application object), "drawing" (the active drawing), or any objectId/geometryId returned by earlier calls. ' +
+      'COM objects in results come back as {objectId, comType} handles; pass them onward as a target or as an argument written {"$id": "obj_N"}. ' +
+      'Use alphacam_api_help first to find the right member and signature, and alphacam_api_inspect to see what a handle is. ' +
+      'Examples: {target:"drawing", member:"CreateCircle", args:[0,0,0,50]} · {target:"app", member:"ActiveDrawing", kind:"get"} · ' +
+      '{target:"obj_3", member:"Name", kind:"set", args:["Part A"]} · ByRef output params: {target:"obj_3", member:"GetStartPoint", args:[0,0,0], byRef:[0,1,2]} returns byRefValues. ' +
+      'CAUTION: this is a raw API line — no safety rails. Mutating calls act on the live drawing immediately.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        target: {
+          type: 'string',
+          description: '"app", "drawing", or an objectId/geometryId from an earlier call. Default "app".',
+        },
+        member: { type: 'string', description: 'Method or property name, e.g. "CreateCircle", "Name", "ScaleL2".' },
+        kind: {
+          type: 'string',
+          enum: ['auto', 'method', 'get', 'set'],
+          description: 'auto (default): method call or property read. get: property read (indexed: pass index args). set: property write (args = [value], or [index..., value]).',
+        },
+        args: {
+          type: 'array',
+          description: 'Arguments in order. Numbers/strings/booleans pass through; write object handles as {"$id": "obj_N"}. Enums are their integer values (see alphacam_api_help).',
+          items: {},
+        },
+        byRef: {
+          type: 'array',
+          items: { type: 'integer' },
+          description: 'Zero-based indices of args passed ByRef (VB "output" parameters). Their post-call values return in byRefValues.',
+        },
+      },
+      required: ['member'],
+    },
+  },
+  {
+    name: 'alphacam_api_inspect',
+    description:
+      'Inspect a live API object handle: its COM type plus its method and property names (reflected from the interop assembly). ' +
+      'With no target, lists every live objectId with its type — useful to reorient after many alphacam_api_invoke calls. ' +
+      'Pair with alphacam_api_help (documentation) and alphacam_api_invoke (execution).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        target: {
+          type: 'string',
+          description: '"app", "drawing", or an objectId. Omit to list all live handles.',
+        },
+      },
+    },
+  },
+  {
+    name: 'alphacam_api_release',
+    description:
+      'Release cached object handles (objectIds/geometryIds) so their COM objects can be freed. ' +
+      'Use after long sessions of alphacam_api_invoke to keep the handle table tidy; releasing an id does NOT delete anything in the drawing. ' +
+      'Note: released ids (and ids from other tools) become invalid.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        objectId: { type: 'string', description: 'One id to release.' },
+        objectIds: { type: 'array', items: { type: 'string' }, description: 'Several ids to release.' },
+        all: { type: 'boolean', description: 'Release every cached handle.' },
+      },
     },
   },
 ];

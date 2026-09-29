@@ -118,7 +118,7 @@ Write-Host ""
 Write-Host "Deploy OK. Now:" -ForegroundColor Green
 Write-Host "  1. Start ALPHACAM. The add-in loads automatically" -ForegroundColor Gray
 Write-Host "     (it does not appear in Utils > Add-Ins - that is normal)." -ForegroundColor Gray
-Write-Host "  2. Restart Claude Desktop." -ForegroundColor Gray
+Write-Host "  2. Restart your MCP client (e.g. Claude Desktop)." -ForegroundColor Gray
 Write-Host "  3. Check the log:" -ForegroundColor Gray
 Write-Host "       Get-Content -Tail 20 `$env:LOCALAPPDATA\AlphacamBridge\shim.log" -ForegroundColor Gray
-Write-Host "  4. Ask Claude: `"give me alphacam status`"" -ForegroundColor Gray
+Write-Host "  4. Ask the agent: `"give me alphacam status`"" -ForegroundColor Gray
