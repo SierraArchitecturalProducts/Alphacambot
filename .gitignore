@@ -1,0 +1,23 @@
+# Build output
+bin/
+obj/
+*.user
+.vs/
+
+# Node
+node_modules/
+
+# Hexagon-derived files - supply from your own ALPHACAM installation (see README)
+src/AlphacamBridge.Shim/PrivateReferences/Interop.AlphaCAMMill.dll
+src/alphacam-mcp-server/data/acamapi-reference.json
+Interop.AlphaCAMMill.dll
+
+# Deploy staging binaries (regenerated from build)
+deploy/*.dll
+deploy/*.pdb
+
+# Personal / runtime
+claude_desktop_config.json
+*.log
+test-output/
+_to_delete/

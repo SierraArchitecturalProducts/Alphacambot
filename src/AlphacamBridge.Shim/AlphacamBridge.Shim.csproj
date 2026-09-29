@@ -1,0 +1,34 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net48</TargetFramework>
+    <OutputType>Library</OutputType>
+    <AssemblyName>CambotAlphacam</AssemblyName>
+    <RootNamespace>CambotAlphacam</RootNamespace>
+    <LangVersion>latest</LangVersion>
+    <PlatformTarget>x64</PlatformTarget>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Allows building net48 without the targeting pack installed -->
+    <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies" Version="1.0.3" PrivateAssets="all" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Microsoft.CSharp for 'dynamic' keyword support -->
+    <Reference Include="Microsoft.CSharp" />
+    <!-- System.Web.Extensions for JavaScriptSerializer (JSON in .NET 4.8) -->
+    <Reference Include="System.Web.Extensions" />
+    <!-- System.Windows.Forms for thread marshaling via Control.Invoke -->
+    <Reference Include="System.Windows.Forms" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Alphacam COM interop - referenced for IAlphaCamApp type in constructor.
+         The DLL is NOT deployed with the add-in; Alphacam provides it at runtime. -->
+    <Reference Include="Interop.AlphaCAMMill">
+      <HintPath>PrivateReferences\Interop.AlphaCAMMill.dll</HintPath>
+      <EmbedInteropTypes>False</EmbedInteropTypes>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+</Project>

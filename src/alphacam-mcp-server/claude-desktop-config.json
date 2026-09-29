@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "alphacam": {
+      "command": "node",
+      "args": [
+        "C:\\path\\to\\Alphacambot\\src\\alphacam-mcp-server\\src\\index.js",
+        "--pipe", "AlphacamBridge",
+        "--key", "anonymous"
+      ]
+    }
+  }
+}

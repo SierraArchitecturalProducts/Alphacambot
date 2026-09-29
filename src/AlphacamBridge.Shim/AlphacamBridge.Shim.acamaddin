@@ -1,0 +1,29 @@
+$1 ' Name of .Net DLL to load, no path or extension.
+CambotAlphacam
+
+$2 ' 1 to always load, 0 to show in Utils | Add-Ins dialog box
+1
+
+$3 ' NoDefaultLoad, = 1 don't load if user registry entry not set. (Only used if $2 = 0)
+0
+
+$4 ' 1 if this is an Extra Cost Option
+0
+
+$10 ' Load for Mill, 1 = yes, 0 = no
+1
+
+$20 ' Load for Router, 1 = yes, 0 = no:
+1
+
+$30 ' Load for Stone, 1 = yes, 0 = no
+1
+
+$40 ' Load for Lathe, 1 = yes, 0 = no
+1
+
+$50 ' Load for Profiling, 1 = yes, 0 = no
+1
+
+$60 ' Load for Wire, 1 = yes, 0 = no
+0

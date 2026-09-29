@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Library</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>AlphacamBridge</AssemblyName>
+    <RootNamespace>AlphacamBridge</RootNamespace>
+
+    <UseWindowsForms>true</UseWindowsForms>
+
+    <!-- COM hosting disabled: Alphacam loads the .NET Framework 4.8 shim instead.
+         The shim starts the Launcher, which references this library. -->
+    <!-- <EnableComHosting>true</EnableComHosting> -->
+    <EnableDynamicLoading>true</EnableDynamicLoading>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\AlphacamBridge.Core\AlphacamBridge.Core.csproj" />
+    <ProjectReference Include="..\AlphacamBridge.ComInterop\AlphacamBridge.ComInterop.csproj" />
+    <PackageReference Include="Microsoft.Extensions.Logging" Version="8.0.0" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Console" Version="8.0.0" />
+    <PackageReference Include="Microsoft.Extensions.Logging.EventLog" Version="8.0.0" />
+  </ItemGroup>
+</Project>

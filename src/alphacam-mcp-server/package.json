@@ -1,0 +1,22 @@
+{
+  "name": "alphacam-mcp-server",
+  "version": "1.0.0",
+  "description": "MCP server that bridges Claude Desktop to Alphacam via named pipe",
+  "type": "module",
+  "main": "src/index.js",
+  "bin": {
+    "alphacam-mcp-server": "src/index.js"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "test": "node --test src/__tests__/"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1"
+  },
+  "devDependencies": {},
+  "license": "MIT"
+}

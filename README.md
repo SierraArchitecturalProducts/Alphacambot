@@ -1,0 +1,135 @@
+# Alphacambot
+
+**Drive Hexagon ALPHACAM® with plain English, through Claude.**
+
+Alphacambot is an open-source bridge that connects the [Claude Desktop app](https://claude.ai/download)
+to ALPHACAM CAD/CAM software. Once installed, you can draw geometry, apply machining,
+run true-shape nesting, and post NC programs by describing what you want in a chat:
+
+> "Draw a 24x12 panel, drill ten 8 mm holes along the bottom, profile the outside
+> with a ramped lead-in in two passes, and post the G-code."
+
+It exposes **59 tools** to Claude covering:
+
+- **Drawing & CAD editing** — rectangles, circles, polygons, text, arbitrary 2D paths;
+  move/rotate/mirror/scale (with array patterns), offset, fillet/chamfer, join, explode
+- **Machining** — profile (rough/finish with helical descent and automatic lead-in/out),
+  pocketing, drilling/tapping (batch), engraving, manual toolpaths
+- **Setup** — tools, posts, panels/materials, layers, work planes, tool sides, start points
+- **Nesting** — parts from your drawing saved to part files, generated nest lists
+  (quantities, rotation rules, gaps, sheet-edge gap), sheets taken from drawing geometry,
+  multi-sheet nests, nested toolpath ordering, per-sheet NC output
+- **Interop** — DXF/STEP/IGES/STL import, DXF/EMF/STL/IGES export, drawing queries
+- **Human-in-the-loop** — act on your current ALPHACAM selection, or have ALPHACAM
+  prompt you to pick geometry mid-conversation
+
+## How it works
+
+```
+Claude Desktop
+   |  stdio (Model Context Protocol)
+Node.js MCP server            src/alphacam-mcp-server
+   |  named pipe "AlphacamBridge" (JSON-RPC 2.0)
+Launcher (.NET 8)             src/AlphacamBridge + AlphacamBridge.Launcher
+   |  named pipe "AlphacamBridgeCmd" (JSON-RPC 2.0)
+In-process add-in (.NET 4.8)  src/AlphacamBridge.Shim  ("CambotAlphacam.dll")
+   |  COM automation, marshalled to the UI thread
+ALPHACAM
+```
+
+ALPHACAM's COM server rejects mutating calls from outside its process, so the shim
+runs inside ALPHACAM as a .NET add-in and executes commands on the UI thread; the
+out-of-process Launcher handles transport, and the Node server speaks MCP to Claude.
+The bridge survives ALPHACAM restarts, cleans up after itself on exit, and heals its
+own processes if one goes away.
+
+## Requirements
+
+- Windows with **ALPHACAM** (developed and tested against ALPHACAM 2025, Router and Mill)
+- **Claude Desktop app** (any plan that fits your usage; local MCP servers are configured
+  via `claude_desktop_config.json`)
+- **Node.js** LTS
+- **.NET 8 Desktop Runtime** (to run) and **.NET SDK** (to build)
+- .NET Framework 4.8 (present on modern Windows)
+
+## Two files you must supply yourself
+
+To respect Hexagon's intellectual property, this repository does **not** include two
+files the build/runtime needs. Both come from your own licensed ALPHACAM installation:
+
+1. **`Interop.AlphaCAMMill.dll`** — the COM interop assembly for ALPHACAM's automation
+   API. Copy it from your ALPHACAM installation (search the install folder), or generate
+   it with `tlbimp` from ALPHACAM's type library. Place it at
+   `src/AlphacamBridge.Shim/PrivateReferences/Interop.AlphaCAMMill.dll` before building.
+   (Despite the "Mill" name it is the canonical interop for Mill, Router, and the other
+   modules.)
+
+2. **`acamapi-reference.json`** *(optional)* — a parsed index of ALPHACAM's API help
+   (`ACAMAPI.chm`) that powers the `alphacam_api_help` tool. Everything else works
+   without it. If you want it, extract your own `ACAMAPI.chm` (7-Zip opens CHM files)
+   and build a JSON of the objects/methods/properties; place it at
+   `src/alphacam-mcp-server/data/acamapi-reference.json`.
+
+## Building
+
+```powershell
+cd src
+dotnet build AlphacamBridge.Shim\AlphacamBridge.Shim.csproj -c Debug      # .NET 4.8 add-in
+dotnet build AlphacamBridge.Launcher\AlphacamBridge.Launcher.csproj -c Debug  # .NET 8 launcher
+cd alphacam-mcp-server
+npm install
+```
+
+## Installing
+
+1. Run `Deploy-Shim.ps1` from an **elevated** PowerShell with ALPHACAM closed.
+   It stages the built add-in into ALPHACAM's `DotNetAdd-Ins\` folder (the
+   `.acamaddin` manifest must be byte-exact — the script handles this) and copies
+   the Launcher to `%LOCALAPPDATA%\Programs\AlphacamBridge`.
+2. Add the server to `%APPDATA%\Claude\claude_desktop_config.json` — see
+   `src/alphacam-mcp-server/claude-desktop-config.json` for the shape (fix the path).
+3. Start ALPHACAM (the add-in loads automatically; it does not appear in
+   Utils > Add-Ins) and restart Claude Desktop.
+4. Ask Claude: *"give me alphacam status"*.
+
+Logs live in `%LOCALAPPDATA%\AlphacamBridge\` (`shim.log`, `launcher.log`).
+See `docs/DEVELOPER-GUIDE.md` for architecture details, the handler pattern for
+adding tools, and a long list of hard-won gotchas.
+
+## Good to know
+
+- The pipe connection drops whenever you interact with ALPHACAM directly — this is
+  normal; Claude reconnects and all state survives.
+- One Claude conversation at a time can use the bridge.
+- Unattended (no-dialog) NC output is tuned for SCM machines with the Xilog Plus post,
+  where the post's `.ini` is adjusted around output. With other post processors NC
+  output works but the post's normal dialog may appear.
+- True-shape nesting is the default engine; rectangular nesting is available as a
+  fallback. Nesting runs typically take 30–60 seconds.
+- **Always review NC programs before running them on a machine.** This software
+  generates real toolpaths for real machinery; you are responsible for verifying
+  every program.
+
+## Trademarks and attribution
+
+- **ALPHACAM®** is a registered trademark of **Hexagon AB** and/or its subsidiaries
+  and affiliates. This project is an independent, community-built integration and is
+  **not affiliated with, endorsed by, or supported by Hexagon**. You need your own
+  licensed copy of ALPHACAM to use it.
+- **Claude** and **Anthropic** are trademarks of **Anthropic, PBC**. This project is
+  not affiliated with or endorsed by Anthropic.
+- **Xilog** and related machine/post names are trademarks of **SCM Group S.p.A.**
+- **Windows**, **.NET**, and **PowerShell** are trademarks of the **Microsoft** group
+  of companies. **Node.js** is a trademark of the **OpenJS Foundation**.
+- All other trademarks are the property of their respective owners.
+
+Alphacambot was built by Sierra Hardware Products, Inc., largely in collaboration
+with Claude itself — the bridge was designed, written, and live-tested through the
+very kind of Claude-driven sessions it now enables.
+
+## License
+
+[MIT](LICENSE) — Copyright (c) 2026 Sierra Hardware Products, Inc.
+
+Provided "as is", without warranty of any kind. CNC machinery can cause injury and
+property damage; validate all generated toolpaths and programs before use.

@@ -1,0 +1,12 @@
+{
+  "pipeName": "AlphacamBridge",
+  "authenticationEnabled": false,
+  "maxMessageSizeBytes": 10485760,
+  "authTimeoutSeconds": 30,
+  "logLevel": "Information",
+  "allowedPaths": {
+    "read": [ "C:\\Alphacam" ],
+    "write": [ "C:\\Temp" ],
+    "denied": []
+  }
+}
