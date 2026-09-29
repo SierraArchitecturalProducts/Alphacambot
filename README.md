@@ -49,50 +49,67 @@ own processes if one goes away.
 - **Claude Desktop app** (any plan that fits your usage; local MCP servers are configured
   via `claude_desktop_config.json`)
 - **Node.js** LTS
-- **.NET 8 Desktop Runtime** (to run) and **.NET SDK** (to build)
+- **.NET SDK 8+** (to build) and the **.NET 8 Desktop Runtime** (to run)
 - .NET Framework 4.8 (present on modern Windows)
 
-## Two files you must supply yourself
+## Quick start
 
-To respect Hexagon's intellectual property, this repository does **not** include two
-files the build/runtime needs. Both come from your own licensed ALPHACAM installation:
-
-1. **`Interop.AlphaCAMMill.dll`** — the COM interop assembly for ALPHACAM's automation
-   API. Copy it from your ALPHACAM installation (search the install folder), or generate
-   it with `tlbimp` from ALPHACAM's type library. Place it at
-   `src/AlphacamBridge.Shim/PrivateReferences/Interop.AlphaCAMMill.dll` before building.
-   (Despite the "Mill" name it is the canonical interop for Mill, Router, and the other
-   modules.)
-
-2. **`acamapi-reference.json`** *(optional)* — a parsed index of ALPHACAM's API help
-   (`ACAMAPI.chm`) that powers the `alphacam_api_help` tool. Everything else works
-   without it. If you want it, extract your own `ACAMAPI.chm` (7-Zip opens CHM files)
-   and build a JSON of the objects/methods/properties; place it at
-   `src/alphacam-mcp-server/data/acamapi-reference.json`.
-
-## Building
+From the repository root, in a PowerShell opened **as Administrator**
+(with ALPHACAM closed):
 
 ```powershell
-cd src
-dotnet build AlphacamBridge.Shim\AlphacamBridge.Shim.csproj -c Debug      # .NET 4.8 add-in
-dotnet build AlphacamBridge.Launcher\AlphacamBridge.Launcher.csproj -c Debug  # .NET 8 launcher
-cd alphacam-mcp-server
-npm install
+.\Setup.ps1
 ```
 
-## Installing
+That one script checks prerequisites, copies the COM interop assembly out of your
+ALPHACAM installation, builds the add-in and the Launcher, installs the MCP server
+and registers it in Claude Desktop's config, builds the optional API-help index
+from your own `ACAMAPI.chm`, and deploys everything. From a non-elevated shell it
+does all of the build/config work and tells you the one remaining elevated step
+(`Deploy-Shim.ps1`).
 
-1. Run `Deploy-Shim.ps1` from an **elevated** PowerShell with ALPHACAM closed.
-   It stages the built add-in into ALPHACAM's `DotNetAdd-Ins\` folder (the
-   `.acamaddin` manifest must be byte-exact — the script handles this) and copies
-   the Launcher to `%LOCALAPPDATA%\Programs\AlphacamBridge`.
-2. Add the server to `%APPDATA%\Claude\claude_desktop_config.json` — see
-   `src/alphacam-mcp-server/claude-desktop-config.json` for the shape (fix the path).
-3. Start ALPHACAM (the add-in loads automatically; it does not appear in
-   Utils > Add-Ins) and restart Claude Desktop.
-4. Ask Claude: *"give me alphacam status"*.
+Then start ALPHACAM (the add-in loads automatically; it does not appear in
+Utils > Add-Ins), restart Claude Desktop, and ask Claude:
+*"give me alphacam status"*.
 
 Logs live in `%LOCALAPPDATA%\AlphacamBridge\` (`shim.log`, `launcher.log`).
+
+## Two files that come from your own ALPHACAM installation
+
+To respect Hexagon's intellectual property, this repository does **not** include two
+files. `Setup.ps1` produces both from your own licensed ALPHACAM installation:
+
+1. **`Interop.AlphaCAMMill.dll`** — the COM interop assembly for ALPHACAM's automation
+   API, required to build. `tools\Get-Interop.ps1` finds it in your ALPHACAM install
+   and copies it to `src/AlphacamBridge.Shim/PrivateReferences/`. (Despite the "Mill"
+   name it is the canonical interop for Mill, Router, and the other modules.)
+
+2. **`acamapi-reference.json`** *(optional)* — an index of ALPHACAM's API help that
+   powers the `alphacam_api_help` tool; everything else works without it.
+   `tools\generate-api-reference.js` builds it by decompiling your own `ACAMAPI.chm`
+   (via Windows' built-in `hh.exe`) and parsing the pages — for your local use only,
+   since the content is Hexagon's documentation.
+
+## Manual build and install
+
+If you prefer to run the steps yourself:
+
+```powershell
+.\tools\Get-Interop.ps1
+dotnet build src\AlphacamBridge.Shim\AlphacamBridge.Shim.csproj -c Debug       # .NET 4.8 add-in
+dotnet build src\AlphacamBridge.Launcher\AlphacamBridge.Launcher.csproj -c Debug   # .NET 8 launcher
+cd src\alphacam-mcp-server
+.\Install.ps1                       # npm install + Claude Desktop config entry
+cd ..\..
+node tools\generate-api-reference.js   # optional API-help index
+.\Deploy-Shim.ps1                   # elevated, ALPHACAM closed
+```
+
+`Deploy-Shim.ps1` stages the built add-in into ALPHACAM's `DotNetAdd-Ins\` folder
+(the `.acamaddin` manifest must be byte-exact — the script handles this) and copies
+the Launcher to `%LOCALAPPDATA%\Programs\AlphacamBridge`. It auto-detects your
+ALPHACAM installation; pass `-AlphacamDir` if you have several.
+
 See `docs/DEVELOPER-GUIDE.md` for architecture details, the handler pattern for
 adding tools, and a long list of hard-won gotchas.
 
