@@ -2204,6 +2204,14 @@ namespace CambotAlphacam
                         mods = new[] { pm };
                     }
 
+                    // Coerce numeric args to the parameter types the interop
+                    // method actually declares. Late-bound IDispatch matches a
+                    // ByRef double slot to a VT_R8|BYREF variant, so a JSON
+                    // integer (VT_I4) throws DISP_E_TYPEMISMATCH — most visible
+                    // on ByRef output params seeded with 0. Reflecting the real
+                    // signature lets a plain "0" stand in for "0.0" everywhere.
+                    CoerceArgsToSignature(target, member, argArr);
+
                     object ret;
                     try
                     {
@@ -2392,6 +2400,56 @@ namespace CambotAlphacam
             }
             catch { }
             try { return comObj.GetType().Name; } catch { return "unknown"; }
+        }
+
+        // Resolve the interop interface Type for a live COM object, or null.
+        private Type ResolveInteropInterface(object comObj)
+        {
+            try
+            {
+                var typeName = GetComTypeName(comObj);
+                var asm = typeof(IAlphaCamApp).Assembly;
+                return asm.GetType("AlphaCAMMill." + typeName, false)
+                    ?? asm.GetType("AlphaCAMMill.I" + typeName, false);
+            }
+            catch { return null; }
+        }
+
+        // Coerce each numeric arg to the element type the interop method's
+        // matching parameter declares (ByRef stripped). Best-effort: unknown
+        // members or unconvertible values are left as-is for InvokeMember.
+        private void CoerceArgsToSignature(object target, string member, object[] argArr)
+        {
+            if (argArr == null || argArr.Length == 0) return;
+            try
+            {
+                var iface = ResolveInteropInterface(target);
+                if (iface == null) return;
+                System.Reflection.ParameterInfo[] pars = null;
+                foreach (var m in iface.GetMethods())
+                {
+                    if (m.Name != member) continue;
+                    var candidate = m.GetParameters();
+                    if (candidate.Length == argArr.Length) { pars = candidate; break; }
+                    if (pars == null) pars = candidate; // fallback: first by name
+                }
+                if (pars == null) return;
+                for (int i = 0; i < argArr.Length && i < pars.Length; i++)
+                {
+                    var a = argArr[i];
+                    if (a == null) continue;
+                    var pt = pars[i].ParameterType;
+                    if (pt.IsByRef) pt = pt.GetElementType();
+                    if (pt == null || pt == typeof(object) || Marshal.IsComObject(a)) continue;
+                    // Only massage primitive numerics/bools/strings; leave COM
+                    // handles and arrays untouched.
+                    if ((a is IConvertible) && (pt.IsPrimitive || pt == typeof(decimal) || pt == typeof(string)))
+                    {
+                        try { argArr[i] = Convert.ChangeType(a, pt); } catch { }
+                    }
+                }
+            }
+            catch { }
         }
 
         // Member lists for a COM type, reflected from the interop assembly.
