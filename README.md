@@ -63,6 +63,26 @@ Paired with `alphacam_api_help` (searchable documentation generated from your ow
 `ACAMAPI.chm`), the agent can discover a member, read its signature, and call it —
 anything the API has, it can do.
 
+## Remembering your shop's setup
+
+Every shop keeps its tool catalog in a different place, uses a different post,
+and works in different units. So the agent doesn't need reminding each session,
+the server keeps a small per-user preferences file at
+`%LOCALAPPDATA%\AlphacamBridge\preferences.json` that any connecting MCP agent
+can read and update:
+
+- `alphacam_get_preferences` — read the saved setup (tool-catalog folder,
+  preferred routing tool, post `.arb`, NC output directory, units, material
+  defaults). The same summary is folded into `alphacam_status`, so an agent
+  sees your setup on its first call.
+- `alphacam_set_preference` — persist what you tell it: *"my tools are in
+  C:\…\Canavan Tools"*, *"default to millimetres"*, and so on.
+
+This also sidesteps a subtle NC gotcha: some posts (e.g. Xilog) reserve certain
+tool **numbers** for drills, so routing with an ad-hoc tool in that range makes
+the post refuse the job. Point the agent at your real catalog once, and it uses
+tools whose numbering your post already expects.
+
 ## Works with any MCP client
 
 The server is built on the official `@modelcontextprotocol/sdk` and speaks plain

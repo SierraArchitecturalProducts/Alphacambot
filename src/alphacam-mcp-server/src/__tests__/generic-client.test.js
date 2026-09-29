@@ -40,6 +40,8 @@ test('generic MCP client: initialize + tools/list', async () => {
       'alphacam_api_invoke',
       'alphacam_api_inspect',
       'alphacam_api_release',
+      'alphacam_get_preferences',
+      'alphacam_set_preference',
       'alphacam_create_rectangle',
       'alphacam_nest',
     ]) {
@@ -72,6 +74,49 @@ test('generic MCP client: tools/call runs server-side (api_help)', async (t) => 
     assert.match(text, /Syntax/i);
   } finally {
     await client.close();
+  }
+});
+
+test('generic MCP client: preferences round-trip (local, no bridge)', async () => {
+  // Isolate the prefs file to a temp LOCALAPPDATA so the test never touches
+  // a real machine's preferences.
+  const os = await import('node:os');
+  const fs = await import('node:fs');
+  const path = await import('node:path');
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'acprefs-'));
+  const client = new Client({ name: 'generic-mcp-client', version: '0.0.1' });
+  const transport = new StdioClientTransport({
+    command: process.execPath, args: [serverPath], stderr: 'ignore',
+    env: { ...process.env, LOCALAPPDATA: tmp },
+  });
+  await client.connect(transport);
+  try {
+    let res = await client.callTool({ name: 'alphacam_get_preferences', arguments: {} });
+    let obj = JSON.parse(res.content[0].text);
+    assert.equal(obj.configured, false, 'fresh prefs should be unconfigured');
+
+    res = await client.callTool({
+      name: 'alphacam_set_preference',
+      arguments: { patch: { toolCatalogFolder: 'C:\\tools', units: 'mm' } },
+    });
+    obj = JSON.parse(res.content[0].text);
+    assert.equal(obj.configured, true);
+    assert.equal(obj.toolCatalogFolder, 'C:\\tools');
+    assert.equal(obj.units, 'mm');
+
+    // A brand-new client reads the persisted value back.
+    const c2 = new Client({ name: 'c2', version: '0.0.1' });
+    const t2 = new StdioClientTransport({
+      command: process.execPath, args: [serverPath], stderr: 'ignore',
+      env: { ...process.env, LOCALAPPDATA: tmp },
+    });
+    await c2.connect(t2);
+    const r2 = await c2.callTool({ name: 'alphacam_get_preferences', arguments: {} });
+    assert.equal(JSON.parse(r2.content[0].text).toolCatalogFolder, 'C:\\tools');
+    await c2.close();
+  } finally {
+    await client.close();
+    fs.rmSync(tmp, { recursive: true, force: true });
   }
 });
 

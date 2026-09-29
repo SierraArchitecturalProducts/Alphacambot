@@ -19,6 +19,9 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { PipeClient } from './pipe-client.js';
 import { TOOL_DEFINITIONS, toBridgeMethod } from './tool-definitions.js';
+import {
+  KNOWN_KEYS, PREFS_PATH, loadPreferences, setPreference, summarisePreferences,
+} from './preferences.js';
 import { parseArgs } from 'node:util';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -186,6 +189,34 @@ rawServer.setRequestHandler(ListToolsRequestSchema, async () => {
     inputSchema: { type: 'object', properties: {} },
   });
 
+  const knownKeyList = Object.entries(KNOWN_KEYS)
+    .map(([k, d]) => `${k}: ${d}`)
+    .join(' | ');
+
+  tools.push({
+    name: 'alphacam_get_preferences',
+    description:
+      'Read this shop\'s saved bridge preferences (tool-catalog folder, preferred routing tool, post processor, NC output dir, units, material defaults). Call this near the start of a machining task so you use the user\'s own setup instead of guessing — it prevents mistakes like creating a tool whose number collides with a post\'s drill-reserved range. Returns the stored values and the file path.',
+    inputSchema: { type: 'object', properties: {} },
+  });
+
+  tools.push({
+    name: 'alphacam_set_preference',
+    description:
+      'Persist a shop preference so future sessions (and other MCP agents) need no reminder. Store what the user tells you: their tool-catalog folder, a safe routing tool, their post .arb and NC output directory, units, default material/thickness. ' +
+      'Use { key, value } for one setting, or { patch: { … } } to set several at once; { key, clear:true } removes one. ' +
+      'Known keys — ' + knownKeyList + ' — but any key is allowed. Saved to ' + PREFS_PATH + '.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        key: { type: 'string', description: 'Preference name, e.g. "toolCatalogFolder" (dotted paths like "post.file" allowed).' },
+        value: { description: 'The value to store (string, number, boolean, or object).' },
+        patch: { type: 'object', description: 'An object of key/value pairs to merge in at once. Set a key to null to remove it.' },
+        clear: { type: 'boolean', description: 'With "key": remove that preference instead of setting it.' },
+      },
+    },
+  });
+
   tools.push({
     name: 'alphacam_api_help',
     description:
@@ -230,10 +261,40 @@ rawServer.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
   }
 
+  // Preferences are handled locally (no bridge call needed).
+  if (name === 'alphacam_get_preferences') {
+    const prefs = summarisePreferences(loadPreferences());
+    return { content: [{ type: 'text', text: JSON.stringify(prefs, null, 2) }] };
+  }
+  if (name === 'alphacam_set_preference') {
+    try {
+      const updated = setPreference(toolArgs ?? {});
+      return { content: [{ type: 'text', text: JSON.stringify(summarisePreferences(updated), null, 2) }] };
+    } catch (err) {
+      return { content: [{ type: 'text', text: `Error: ${err.message}` }], isError: true };
+    }
+  }
+
+  // ── Preference hooks: wire specific prefs to specific tools ──────
+  // If a tool needs a shop-specific value the caller didn't supply, fill it
+  // from saved preferences; and for values that must not be guessed (e.g. the
+  // post processor — never silently assume Xilog), stop and ask the user to
+  // provide it once, so it can be saved for next time.
+  {
+    const hookResult = applyPreferenceHooks(name, toolArgs);
+    if (hookResult) return hookResult;   // short-circuit: ask the user
+  }
+
   try {
     // Convert MCP tool name to bridge method name
     const bridgeMethod = toBridgeMethod(name);
     const result = await bridgeRequest(bridgeMethod, toolArgs ?? {});
+
+    // Fold user preferences into status so the agent sees the shop's setup on
+    // its habitual first call, without a separate round-trip.
+    if (name === 'alphacam_status' && result && typeof result === 'object') {
+      try { result.preferences = summarisePreferences(loadPreferences()); } catch { /* non-fatal */ }
+    }
 
     // Format result for MCP - must return content array
     const text =
@@ -256,6 +317,69 @@ rawServer.setRequestHandler(CallToolRequestSchema, async (request) => {
     };
   }
 });
+
+// ── Preference hooks ─────────────────────────────────────────
+//
+// Maps a tool to the preference(s) it depends on. Each hook:
+//   arg   - the tool argument the preference fills
+//   key   - the preference key (dotted paths allowed)
+//   mode  - 'inject' : silently supply the saved value when the caller omitted
+//                      the arg (explicit caller args always win);
+//           'ask'    : if the arg is omitted AND no preference is saved, do NOT
+//                      run the tool — return guidance asking the user for the
+//                      value so it can be saved. Prevents dangerous guesses
+//                      (e.g. defaulting every shop to the Xilog post).
+//   label - human phrase used in the ask message.
+const PREF_HOOKS = {
+  alphacam_list_tools:   [{ arg: 'folder',   key: 'toolCatalogFolder', mode: 'inject' }],
+  alphacam_select_tool:  [{ arg: 'fileName', key: 'defaultRoutingTool', mode: 'inject' }],
+  alphacam_select_post:  [{ arg: 'fileName', key: 'postFile', mode: 'ask',
+                            label: 'your post processor (.arb) path' }],
+  alphacam_specify_panel:[{ arg: 'thickness', key: 'defaultPanelThickness', mode: 'inject' }],
+  alphacam_set_material: [{ arg: 'name', key: 'defaultMaterial', mode: 'inject' }],
+};
+
+function getPrefValue(prefs, dottedKey) {
+  return dottedKey.split('.').reduce((o, k) => (o == null ? undefined : o[k]), prefs);
+}
+
+/**
+ * Apply preference hooks for a tool call. Mutates toolArgs to inject saved
+ * values. Returns a short-circuit MCP result (ask-the-user) when a required
+ * preference is missing, otherwise null (proceed with the call).
+ */
+function applyPreferenceHooks(name, toolArgs) {
+  const hooks = PREF_HOOKS[name];
+  if (!hooks) return null;
+  const prefs = loadPreferences();
+  const asks = [];
+  for (const h of hooks) {
+    const provided = toolArgs && toolArgs[h.arg] !== undefined && toolArgs[h.arg] !== '';
+    if (provided) continue;                          // explicit caller value wins
+    const val = getPrefValue(prefs, h.key);
+    if (val !== undefined && val !== null && val !== '') {
+      if (toolArgs) toolArgs[h.arg] = val;           // inject saved value
+      continue;
+    }
+    if (h.mode === 'ask') asks.push(h);              // missing + must not guess
+  }
+  if (asks.length === 0) return null;
+  const lines = asks.map(
+    (h) => `- ${h.label} — once you tell me, I'll save it with ` +
+           `alphacam_set_preference { "key": "${h.key}", "value": "…" } so I won't ask again.`,
+  );
+  return {
+    content: [{
+      type: 'text',
+      text:
+        `This step needs a shop-specific setting that isn't saved yet, and I ` +
+        `shouldn't guess it:\n${lines.join('\n')}\n\n` +
+        `Tell me the value (or say to use a specific default) and I'll proceed.`,
+    }],
+    // Not an error — it's a request for input. isError stays false so the
+    // agent treats it as a normal prompt to relay to the user.
+  };
+}
 
 // ── API Help Handler ─────────────────────────────────────────
 
@@ -464,8 +588,9 @@ async function main() {
   log('INFO', `Alphacam MCP Server starting`);
   log('INFO', `Bridge pipe: \\\\.\\pipe\\${PIPE_NAME}`);
   log('INFO', `API key: ${API_KEY === 'anonymous' ? '(anonymous)' : '(set)'}`);
-  log('INFO', `Tools registered: ${TOOL_DEFINITIONS.length + 2}`);
+  log('INFO', `Tools registered: ${TOOL_DEFINITIONS.length + 4}`);
   log('INFO', `API reference: ${apiReference ? 'loaded' : 'NOT FOUND'}`);
+  log('INFO', `Preferences: ${PREFS_PATH}`);
 
   const transport = new StdioServerTransport();
   await rawServer.connect(transport);

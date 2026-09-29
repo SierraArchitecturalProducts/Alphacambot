@@ -312,6 +312,21 @@ This is the tiered approach: tool descriptions contain enough context for normal
 
 Additional CHM files from the ALPHACAM installation (AEDITAPI.chm, ConstraintsAPI.chm, Feature.chm, etc.) cover supplementary APIs not yet parsed.
 
+## User Preferences
+
+`alphacam-mcp-server/src/preferences.js` maintains a per-user JSON file at
+`%LOCALAPPDATA%\AlphacamBridge\preferences.json` (falls back to
+`~/.alphacambridge/preferences.json` off Windows). It is pure server-side
+metadata — nothing here calls Alphacam. Two tools expose it,
+`alphacam_get_preferences` and `alphacam_set_preference` (both handled locally
+in `index.js`, no bridge round-trip), and `handleApiHelp`-style folding adds a
+`preferences` summary onto `alphacam_status` so an agent sees the shop's setup
+on its habitual first call. Known keys: toolCatalogFolder, defaultRoutingTool,
+postFile, ncOutputDir, units, defaultMaterial, defaultPanelThickness, notes —
+but arbitrary keys are allowed. Writes are additive/merge; `{key, clear:true}`
+removes one. This is how the server avoids re-asking about shop-specific setup,
+and how it steers around posts that reserve tool-number ranges for drills.
+
 ## Generic Full-API Layer
 
 Beyond the curated tools, three tools give 100% coverage of the automation API via late-bound COM (`Type.InvokeMember` → IDispatch) in the shim:
