@@ -117,6 +117,15 @@ const METHOD_TIMEOUTS = {
   'alphacam.save_part': 5 * 60 * 1000,
   // Generic API calls can hit interactive members (UserSelect*, dialogs).
   'alphacam.api_invoke': 5 * 60 * 1000,
+  // 3D (added 2026-09-29): surface/solid machining computes for a while on
+  // dense models, accepts interactive:true, and posting a 3D toolpath with
+  // thousands of moves blew the 30 s default (observed on a 6,000-element
+  // parallel finish). Big STL imports are slow too.
+  'alphacam.machine_3d': 15 * 60 * 1000,
+  'alphacam.delete_3d_model': 5 * 60 * 1000,
+  'alphacam.import_cad': 5 * 60 * 1000,
+  'alphacam.output_nc': 5 * 60 * 1000,
+  'alphacam.simulate': 15 * 60 * 1000,
 };
 
 /**

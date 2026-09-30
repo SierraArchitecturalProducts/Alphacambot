@@ -28,6 +28,8 @@ namespace CambotAlphacam
         private double? _lastPanelSizeX;
         private double? _lastPanelSizeY;
         private double? _lastPanelThickness;
+        // True once specify_panel / specify_material ran in this session (plan checks).
+        private bool _materialDefined;
         private readonly string _logPath;
 
         private Thread _listenThread;
@@ -132,6 +134,21 @@ namespace CambotAlphacam
             var prms = dict.ContainsKey("params") ? dict["params"] as Dictionary<string, object> ?? new Dictionary<string, object>() : new Dictionary<string, object>();
             try
             {
+                // Job queries are answered on the pipe thread so they get
+                // through while a long operation holds the UI thread.
+                if (method == "alphacam.job_status") return BuildSuccessResponse(id, JobStatus(prms));
+
+                // background:true on a long-running method → queue it on the
+                // UI thread (BeginInvoke), return a job id at once, and let the
+                // caller poll alphacam.job_status. Added 2026-09-29 because
+                // posting/simulating dense 3D toolpaths outlives the pipe and
+                // MCP-client timeouts.
+                if (GetBool(prms, "background", false) && BackgroundMethods.Contains(method))
+                {
+                    var job = StartJob(method, prms);
+                    return BuildSuccessResponse(id, job);
+                }
+
                 object result = null;
                 Exception comError = null;
                 _marshalControl.Invoke(new Action(() =>
@@ -143,6 +160,63 @@ namespace CambotAlphacam
                 return BuildSuccessResponse(id, result);
             }
             catch (Exception ex) { return BuildErrorResponse(id, -32603, "Marshal error: " + ex.Message); }
+        }
+
+        // ── Background jobs ────────────────────────────────────────
+        private sealed class JobInfo
+        {
+            public string Id, Method, State; // running | done | error
+            public object Result; public string Error;
+            public DateTime Started, Finished;
+        }
+        private static readonly HashSet<string> BackgroundMethods = new HashSet<string>
+        {
+            "alphacam.output_nc", "alphacam.machine_3d", "alphacam.simulate", "alphacam.import_cad", "alphacam.nest",
+        };
+        private readonly Dictionary<string, JobInfo> _jobs = new Dictionary<string, JobInfo>();
+        private int _nextJobId = 1;
+
+        private Dictionary<string, object> StartJob(string method, Dictionary<string, object> prms)
+        {
+            var job = new JobInfo { Id = "job_" + _nextJobId++, Method = method, State = "running", Started = DateTime.Now };
+            lock (_jobs) _jobs[job.Id] = job;
+            var innerPrms = new Dictionary<string, object>(prms);
+            innerPrms.Remove("background");
+            _marshalControl.BeginInvoke(new Action(() =>
+            {
+                try { var r = DispatchMethod(method, innerPrms); lock (_jobs) { job.Result = r; job.State = "done"; job.Finished = DateTime.Now; } }
+                catch (Exception ex) { lock (_jobs) { job.Error = ex.GetType().Name + ": " + ex.Message; job.State = "error"; job.Finished = DateTime.Now; } }
+                Log("Job " + job.Id + " (" + method + ") " + job.State);
+            }));
+            return new Dictionary<string, object>
+            {
+                ["jobId"] = job.Id, ["method"] = method, ["state"] = "running",
+                ["message"] = "Started in the background — poll alphacam_job_status with this jobId (every 10-20 s) until state is done or error."
+            };
+        }
+
+        private object JobStatus(Dictionary<string, object> prms)
+        {
+            var idStr = GetString(prms, "jobId", "");
+            lock (_jobs)
+            {
+                if (string.IsNullOrEmpty(idStr))
+                {
+                    var all = new List<object>();
+                    foreach (var j in _jobs.Values) all.Add(new Dictionary<string, object> { ["jobId"] = j.Id, ["method"] = j.Method, ["state"] = j.State, ["started"] = j.Started.ToString("s") });
+                    return new Dictionary<string, object> { ["jobs"] = all };
+                }
+                JobInfo job;
+                if (!_jobs.TryGetValue(idStr, out job)) throw new ArgumentException("Unknown jobId " + idStr);
+                var d = new Dictionary<string, object>
+                {
+                    ["jobId"] = job.Id, ["method"] = job.Method, ["state"] = job.State,
+                    ["elapsedSeconds"] = Math.Round(((job.State == "running" ? DateTime.Now : job.Finished) - job.Started).TotalSeconds, 1)
+                };
+                if (job.State == "done") d["result"] = job.Result;
+                if (job.State == "error") d["error"] = job.Error;
+                return d;
+            }
         }
 
         private object DispatchMethod(string method, Dictionary<string, object> prms)
@@ -466,16 +540,92 @@ namespace CambotAlphacam
                 case "alphacam.import_cad":
                 {
                     var path = GetString(prms, "path");
+                    if (string.IsNullOrEmpty(path)) throw new ArgumentException("path is required");
                     var format = GetString(prms, "format", "").ToLowerInvariant();
+                    if (string.IsNullOrEmpty(format))
+                    {
+                        var ext = (Path.GetExtension(path) ?? "").TrimStart('.').ToLowerInvariant();
+                        if (ext == "dwg") format = "dxf";
+                        else if (ext == "igs") format = "iges";
+                        else if (ext == "stp") format = "step";
+                        else format = ext;
+                    }
+                    // clear=true (default) is File>New semantics: it also drops
+                    // the current tool selection, so callers re-select a tool
+                    // afterwards. clear=false merges into the open drawing.
+                    bool clear = GetBool(prms, "clear", true);
+                    // asSolid: route STL/STEP/other solid formats through
+                    // App.OpenExternalFile, which produces a SolidPart that the
+                    // 3D machining commands (machine_3d) can act on. The legacy
+                    // App.OpenStlFile explodes an STL into one Path per facet
+                    // (Path.STL=true) — visible, but NOT machinable as a 3D
+                    // model ("No Surfaces/Solid Selected"). Verified 2026-09-29.
+                    bool asSolid = GetBool(prms, "asSolid", format != "dxf" && format != "iges" && format != "step");
+                    dynamic drwBefore = _app.ActiveDrawing;
+                    int solidsBefore = 0, surfacesBefore = 0, geosBefore = 0;
+                    if (!clear)
+                    {
+                        try { solidsBefore = (int)drwBefore.SolidParts.Count; } catch { }
+                        try { surfacesBefore = (int)drwBefore.Surfaces.Count; } catch { }
+                        try { geosBefore = (int)drwBefore.GetGeoCount(); } catch { }
+                    }
+                    string importMethod;
                     switch (format)
                     {
-                        case "dxf": _app.OpenDxfFile(path, true); break;
-                        case "iges": _app.OpenIgesFile(path, true, 0); break;
-                        case "step": _app.OpenStepFile(path, true); break;
-                        case "stl": _app.OpenStlFile(path, true); break;
-                        default: throw new ArgumentException("Unsupported format: " + format);
+                        case "dxf": _app.OpenDxfFile(path, clear); importMethod = "OpenDxfFile"; break;
+                        case "iges": _app.OpenIgesFile(path, clear, 0); importMethod = "OpenIgesFile"; break;
+                        case "step":
+                            if (asSolid) { _app.OpenExternalFile(path, "", clear); importMethod = "OpenExternalFile"; }
+                            else { _app.OpenStepFile(path, clear); importMethod = "OpenStepFile"; }
+                            break;
+                        case "stl":
+                            if (asSolid) { _app.OpenExternalFile(path, "", clear); importMethod = "OpenExternalFile"; }
+                            else { _app.OpenStlFile(path, clear); importMethod = "OpenStlFile"; }
+                            break;
+                        default:
+                            // Any other extension (x_t, x_b, sldprt, sat, ipt, ...)
+                            // goes to the add-in import registry; the extension
+                            // picks the importer.
+                            _app.OpenExternalFile(path, GetString(prms, "externalType", ""), clear);
+                            importMethod = "OpenExternalFile";
+                            break;
                     }
-                    return new Dictionary<string, object> { ["format"] = format, ["path"] = path };
+                    dynamic drw = _app.ActiveDrawing;
+                    int solidsAfter = 0, surfacesAfter = 0, geosAfter = 0;
+                    try { solidsAfter = (int)drw.SolidParts.Count; } catch { }
+                    try { surfacesAfter = (int)drw.Surfaces.Count; } catch { }
+                    try { geosAfter = (int)drw.GetGeoCount(); } catch { }
+                    var newSolidIds = new List<string>();
+                    try
+                    {
+                        dynamic parts = drw.SolidParts;
+                        for (int i = solidsBefore + 1; i <= solidsAfter; i++) newSolidIds.Add(StoreObject(parts.Item(i)));
+                    }
+                    catch { }
+                    var newSurfaceIds = new List<string>();
+                    try
+                    {
+                        dynamic surfs = drw.Surfaces;
+                        for (int i = surfacesBefore + 1; i <= surfacesAfter; i++) newSurfaceIds.Add(StoreObject(surfs.Item(i)));
+                    }
+                    catch { }
+                    var importRes = new Dictionary<string, object>
+                    {
+                        ["format"] = format,
+                        ["path"] = path,
+                        ["method"] = importMethod,
+                        ["cleared"] = clear,
+                        ["solidPartCount"] = solidsAfter,
+                        ["surfaceCount"] = surfacesAfter,
+                        ["geometryCount"] = geosAfter,
+                        ["newSolidIds"] = newSolidIds,
+                        ["newSurfaceIds"] = newSurfaceIds,
+                    };
+                    if (importMethod == "OpenStlFile")
+                        importRes["note"] = "Legacy facet import: the STL is now " + (geosAfter - geosBefore) + " facet geometries (Path.STL=true), not a 3D model. For 3D machining re-import with asSolid:true.";
+                    else if (clear)
+                        importRes["note"] = "Drawing was cleared before import (File>New semantics) — re-select the tool and post before machining.";
+                    return importRes;
                 }
 
                 case "alphacam.select_post":
@@ -607,6 +757,7 @@ namespace CambotAlphacam
                     // Remember the dims so output_nc can auto-fill sDX/sDY/sDZ
                     // in the XilogPost.ini without the caller re-supplying them.
                     _lastPanelSizeX = sizeX;
+                    _materialDefined = true;
                     _lastPanelSizeY = sizeY;
                     _lastPanelThickness = Math.Abs(thickness);
                     return new Dictionary<string, object>
@@ -622,6 +773,7 @@ namespace CambotAlphacam
 
                 case "alphacam.specify_material":
                 {
+                    _materialDefined = true;
                     var sizeX = GetDouble(prms, "sizeX");
                     var sizeY = GetDouble(prms, "sizeY");
                     var thickness = GetDouble(prms, "thickness");
@@ -1020,6 +1172,7 @@ namespace CambotAlphacam
                     md.RoughFinishNumberOfCuts = GetInt(prms, "lateralCuts", 1);
                     if (prms.ContainsKey("feedRate")) md.CutFeed = (float)GetDouble(prms, "feedRate", 0);
                     if (prms.ContainsKey("spindleSpeed")) md.SpindleSpeed = (float)GetDouble(prms, "spindleSpeed", 0);
+                    var rfSides = ApplySidesAndAutoZ(md, prms, (bool)md.HelicalInterpolation);
                     // Per ACAMAPI: leads for rough_finish are added by calling
                     // Path.SetLeadInOutAuto on each returned toolpath, NOT by
                     // setting LeadData on MillData beforehand. Capture the
@@ -1037,6 +1190,7 @@ namespace CambotAlphacam
                         ["rapidDownTo"] = (double)md.RapidDownTo,
                         ["toolPathCount"] = (int)drw.GetToolPathCount(),
                         ["leadsApplied"] = rfLeadsApplied,
+                        ["sides"] = rfSides,
                         ["message"] = "RoughFinish operation completed"
                     };
                 }
@@ -1099,6 +1253,7 @@ namespace CambotAlphacam
                     }
                     if (prms.ContainsKey("feedRate")) md.CutFeed = (float)GetDouble(prms, "feedRate", 0);
                     if (prms.ContainsKey("spindleSpeed")) md.SpindleSpeed = (float)GetDouble(prms, "spindleSpeed", 0);
+                    var pkSides = ApplySidesAndAutoZ(md, prms, false);
                     // Leads: same pattern as rough_finish — capture the Paths
                     // returned by md.Pocket() and call SetLeadInOutAuto on each.
                     // (The old MillData.LeadData approach produced no visible
@@ -1118,6 +1273,7 @@ namespace CambotAlphacam
                         ["rapidDownTo"] = (double)md.RapidDownTo,
                         ["toolPathCount"] = (int)drw.GetToolPathCount(),
                         ["leadsApplied"] = pkLeadsApplied,
+                        ["sides"] = pkSides,
                         ["message"] = "Pocket operation completed"
                     };
                 }
@@ -2169,79 +2325,628 @@ namespace CambotAlphacam
                 //  remain the safe fast path for common workflows.
                 // ════════════════════════════════════════════════════════
 
-                case "alphacam.api_invoke":
+                // ── 3D models: solids (STL/Parasolid/STEP-as-solid) and surfaces ──
+                case "alphacam.list_3d_models":
                 {
-                    var target = ResolveApiTarget(GetString(prms, "target", "app"));
-                    var member = GetString(prms, "member", "");
-                    if (string.IsNullOrEmpty(member)) throw new ArgumentException("member is required");
-                    var kind = GetString(prms, "kind", "auto");
-                    var argArr = ConvertApiArgs(prms.ContainsKey("args") ? prms["args"] as System.Collections.ArrayList : null);
-
-                    System.Reflection.BindingFlags flags;
-                    switch (kind)
-                    {
-                        case "get": flags = System.Reflection.BindingFlags.GetProperty; break;
-                        case "set": flags = System.Reflection.BindingFlags.SetProperty; break;
-                        case "method": flags = System.Reflection.BindingFlags.InvokeMethod; break;
-                        case "auto": flags = System.Reflection.BindingFlags.InvokeMethod | System.Reflection.BindingFlags.GetProperty; break;
-                        default: throw new ArgumentException("kind must be auto, method, get or set");
-                    }
-                    if (kind == "set" && argArr.Length == 0)
-                        throw new ArgumentException("kind:\"set\" needs args (the new value; for indexed properties the index args first, value last)");
-
-                    System.Reflection.ParameterModifier[] mods = null;
-                    var byRefList = prms.ContainsKey("byRef") ? prms["byRef"] as System.Collections.ArrayList : null;
-                    if (byRefList != null && byRefList.Count > 0)
-                    {
-                        if (argArr.Length == 0) throw new ArgumentException("byRef given but args is empty");
-                        var pm = new System.Reflection.ParameterModifier(argArr.Length);
-                        foreach (var o in byRefList)
-                        {
-                            var idx = Convert.ToInt32(o);
-                            if (idx < 0 || idx >= argArr.Length) throw new ArgumentException("byRef index " + idx + " out of range");
-                            pm[idx] = true;
-                        }
-                        mods = new[] { pm };
-                    }
-
-                    // Coerce numeric args to the parameter types the interop
-                    // method actually declares. Late-bound IDispatch matches a
-                    // ByRef double slot to a VT_R8|BYREF variant, so a JSON
-                    // integer (VT_I4) throws DISP_E_TYPEMISMATCH — most visible
-                    // on ByRef output params seeded with 0. Reflecting the real
-                    // signature lets a plain "0" stand in for "0.0" everywhere.
-                    CoerceArgsToSignature(target, member, argArr);
-
-                    object ret;
+                    dynamic drw = _app.ActiveDrawing;
+                    var solids = new List<object>();
+                    foreach (var kv in EnumerateSolidParts(drw)) solids.Add(DescribeSolidPart(kv.Key, kv.Value));
+                    var surfaces = new List<object>();
+                    foreach (var kv in EnumerateSurfaces(drw)) surfaces.Add(DescribeSurface(kv.Key, kv.Value));
+                    // Legacy facet STLs (App.OpenStlFile) show up as ordinary
+                    // geometries flagged Path.STL — count them so the agent can
+                    // tell "there is an STL on screen" from "there is a model
+                    // I can machine".
+                    int facetGeos = 0;
                     try
                     {
-                        ret = target.GetType().InvokeMember(member, flags, null, target, argArr, mods, null, null);
+                        dynamic geos = drw.Geometries;
+                        int gcount = (int)geos.Count;
+                        if (gcount <= 50000)
+                            for (int i = 1; i <= gcount; i++) { try { if ((bool)geos.Item(i).STL) facetGeos++; } catch { } }
                     }
-                    catch (Exception ex)
+                    catch { }
+                    return new Dictionary<string, object>
                     {
-                        var inner = (ex is System.Reflection.TargetInvocationException && ex.InnerException != null) ? ex.InnerException : ex;
-                        var com = inner as COMException;
-                        if (com != null && (uint)com.HResult == 0x80020006)
-                            throw new ArgumentException("'" + member + "' is not a member of " + GetComTypeName(target) + ". Check spelling with alphacam_api_help.");
-                        if (com != null && (uint)com.HResult == 0x8002000E)
-                            throw new ArgumentException("'" + member + "' was called with the wrong number of arguments (" + argArr.Length + "). Check the signature with alphacam_api_help.");
-                        if (com != null && ((uint)com.HResult == 0x80020005 || (uint)com.HResult == 0x80020008))
-                            throw new ArgumentException("'" + member + "' argument type mismatch: " + inner.Message + ". Check the signature with alphacam_api_help.");
-                        throw new InvalidOperationException(GetComTypeName(target) + "." + member + " failed: " + inner.Message);
+                        ["solidCount"] = solids.Count,
+                        ["surfaceCount"] = surfaces.Count,
+                        ["solids"] = solids,
+                        ["surfaces"] = surfaces,
+                        ["legacyStlFacetGeometries"] = facetGeos,
+                        ["hint"] = solids.Count + surfaces.Count == 0
+                            ? (facetGeos > 0
+                                ? "Only legacy STL facet geometries are present (not machinable as a model). Re-import with alphacam_import_cad asSolid:true."
+                                : "No 3D models. Import one with alphacam_import_cad (STL/STEP/Parasolid) or build surfaces via the API.")
+                            : "Pass modelIds to alphacam_machine_3d, or all:true to machine every model."
+                    };
+                }
+
+                case "alphacam.delete_3d_model":
+                {
+                    dynamic drw = _app.ActiveDrawing;
+                    var targets = Resolve3DModels(prms, drw);
+                    int deleted = 0;
+                    var failed = new List<string>();
+                    foreach (var kv in targets)
+                    {
+                        try
+                        {
+                            var sp = AsSolidPart(kv.Value);
+                            if (sp != null)
+                            {
+                                // Delete lives on the IUnknown-only ISolidPartEx.
+                                var ex = kv.Value as ISolidPartEx;
+                                if (ex == null) throw new InvalidOperationException("SolidPart does not expose ISolidPartEx.Delete");
+                                ex.Delete();
+                            }
+                            else
+                            {
+                                var su = AsSurface(kv.Value);
+                                if (su != null) su.Delete();
+                                else { dynamic d = kv.Value; d.Delete(); }
+                            }
+                            RemoveFromCache(kv.Key);
+                            deleted++;
+                        }
+                        catch (Exception ex) { failed.Add(kv.Key + ": " + ex.Message); }
+                    }
+                    try { drw.Redraw(); } catch { }
+                    var delRes = new Dictionary<string, object> { ["deleted"] = deleted };
+                    if (failed.Count > 0) delRes["failed"] = failed;
+                    return delRes;
+                }
+
+                case "alphacam.machine_3d":
+                {
+                    dynamic drw = _app.ActiveDrawing;
+                    var strategy = GetString(prms, "strategy", "parallel");
+                    var key = strategy.ToLowerInvariant().Replace("_", "").Replace("-", "").Replace(" ", "");
+                    bool roughing = key == "rough" || key == "roughing" || key == "zcontourroughing" || key == "zcontourrough";
+                    short methodCode = roughing ? (short)1 : SurfaceMethodCode(key);
+
+                    var targets = Resolve3DModels(prms, drw);
+
+                    // Tool diameter drives the stepover defaults.
+                    double toolDia = 0;
+                    try { dynamic curTool = _app.GetCurrentTool(); if (curTool != null) toolDia = (double)curTool.Diameter; } catch { }
+                    if (toolDia <= 0) throw new InvalidOperationException("No tool selected — call alphacam_select_tool first (importing with clear:true drops the tool selection).");
+
+                    dynamic md = _app.CreateMillData();
+
+                    // Optional stock model (roughing): Alphacam reads "the
+                    // currently selected STL or Solid" at the moment of the
+                    // call, so select the stock alone, register it, then
+                    // switch the selection to the machining targets.
+                    string stockId = prms.ContainsKey("stockModelId") ? GetString(prms, "stockModelId", "") : null;
+                    object stockObj = null;
+                    if (!string.IsNullOrEmpty(stockId))
+                    {
+                        if (!_objectCache.TryGetValue(stockId, out stockObj)) throw new InvalidOperationException("stockModelId " + stockId + " not found — use ids from alphacam_list_3d_models");
+                        if (AsSolidPart(stockObj) == null && AsSurface(stockObj) == null) throw new ArgumentException("stockModelId " + stockId + " is not a solid or surface");
+                        // Remembered so simulate excludes it from the "model".
+                        if (!_stockModels.Exists(o => SameModel(o, stockObj))) _stockModels.Add(stockObj);
                     }
 
-                    var res = new Dictionary<string, object> { ["result"] = ConvertApiResult(ret) };
-                    if (mods != null)
+                    int solidsSelected, surfacesSelected;
+                    Set3DSelection(drw, targets, out solidsSelected, out surfacesSelected);
+
+                    // Plan checks (added 2026-09-29 after a demo cut a ring
+                    // instead of a dome): know the model's box, refuse a
+                    // clearance plane inside it, and collect warnings that
+                    // the agent will see next to the result.
+                    var warnings = new List<string>();
+                    double res3d_topMin = double.NaN;
+                    double mMinX, mMinY, mMinZ, mMaxX, mMaxY, mMaxZ;
+                    ModelBounds(targets, out mMinX, out mMinY, out mMinZ, out mMaxX, out mMaxY, out mMaxZ);
+                    bool haveModelBounds = !double.IsInfinity(mMinZ);
+                    double safeZ = GetDouble(prms, "safeRapidLevel", 1.0);
+                    double rapidZ = GetDouble(prms, "rapidDownTo", 0.25);
+                    if (haveModelBounds && safeZ <= mMaxZ)
+                        throw new ArgumentException("safeRapidLevel " + safeZ + " is not above the model top (maxZ " + Math.Round(mMaxZ, 4) + ") — rapids would cross the part. Use a value above " + Math.Round(mMaxZ, 4) + " (and above the stock top).");
+                    if (haveModelBounds && rapidZ < mMaxZ)
+                        warnings.Add("rapidDownTo " + rapidZ + " is below the model top (" + Math.Round(mMaxZ, 4) + "): the tool rapids into the part's Z range before feeding. Usually rapidDownTo should sit just above the stock top.");
+                    // Material: the drawing's Workpieces collection is the
+                    // truth (survives reopening the file / shim restarts);
+                    // the session flag is only a fallback.
+                    bool materialDefined = _materialDefined;
+                    double stockTopZ = double.NaN;
+                    try
                     {
-                        var outVals = new Dictionary<string, object>();
-                        foreach (var o in byRefList)
+                        dynamic wps = drw.Workpieces;
+                        int wpc = (int)wps.Count;
+                        if (wpc > 0)
                         {
-                            var idx = Convert.ToInt32(o);
-                            outVals[idx.ToString()] = ConvertApiResult(argArr[idx]);
+                            materialDefined = true;
+                            for (int wi = 1; wi <= wpc; wi++) { try { double wz = (double)wps.Item(wi).MaxZ; if (double.IsNaN(stockTopZ) || wz > stockTopZ) stockTopZ = wz; } catch { } }
                         }
-                        res["byRefValues"] = outVals;
                     }
-                    return res;
+                    catch { }
+                    if (!materialDefined)
+                        warnings.Add("No panel/material is defined in the drawing (alphacam_specify_panel / alphacam_specify_material). Roughing takes its stock from it, simulation needs it and the post reads it.");
+                    else if (!double.IsNaN(stockTopZ) && safeZ <= stockTopZ)
+                        warnings.Add("safeRapidLevel " + safeZ + " is not above the stock top (" + Math.Round(stockTopZ, 4) + ") — rapids would cross the material.");
+
+                    md.SurfaceMCAction = roughing ? (short)2 : (short)0;
+                    if (!roughing) md.SurfaceMCMethod = methodCode;
+                    md.SurfaceMCAxisType = AxisTypeCode(GetString(prms, "axisType", "3axis"));
+                    if (prms.ContainsKey("fiveAxisAngle")) md.SurfaceMC5AxisAngle = GetDouble(prms, "fiveAxisAngle");
+
+                    md.SafeRapidLevel = GetDouble(prms, "safeRapidLevel", 1.0);
+                    md.RapidDownTo = GetDouble(prms, "rapidDownTo", 0.25);
+                    md.ChordError = (float)GetDouble(prms, "chordError", 0.001);
+                    if (prms.ContainsKey("facetToleranceMultiplier")) md.FacetToleranceMultiplier = GetDouble(prms, "facetToleranceMultiplier");
+
+                    // Stepover: WidthOfCut, or CuspHeight (scallop) when given.
+                    double stepover = GetDouble(prms, "stepover", toolDia * (roughing ? 0.5 : 0.1));
+                    md.WidthOfCut = (float)stepover;
+                    if (prms.ContainsKey("cuspHeight")) md.CuspHeight = (float)GetDouble(prms, "cuspHeight");
+
+                    if (roughing)
+                    {
+                        md.MaxDepthPerCut = (float)GetDouble(prms, "maxDepthPerCut", toolDia * 0.5);
+                        md.StockXY = (float)GetDouble(prms, "stockXY", GetDouble(prms, "stock", 0.0));
+                        md.StockZ = (float)GetDouble(prms, "stockZ", GetDouble(prms, "stock", 0.0));
+                        var pt = GetString(prms, "pocketType", "contour").ToLowerInvariant();
+                        md.PocketType = (short)(pt == "linear" ? 1 : pt == "spiral" ? 2 : 0);
+                        md.SurfaceMCZOrder = (short)(GetString(prms, "zOrder", "zone").ToLowerInvariant() == "depth" ? 1 : 0);
+                        md.SurfaceMCUseFlatAreas = GetBool(prms, "useFlatAreas", false);
+                        md.SurfaceMCRoughingUsePreviousMachining = GetBool(prms, "usePreviousMachining", false);
+                    }
+                    else
+                    {
+                        md.Stock = (float)GetDouble(prms, "stock", 0.0);
+                    }
+
+                    if (prms.ContainsKey("cutDirection"))
+                    {
+                        var cd = GetString(prms, "cutDirection", "bidirectional").ToLowerInvariant();
+                        md.CutDirection = (short)(cd == "conventional" ? 1 : cd == "climb" ? 2 : 0);
+                    }
+                    if (prms.ContainsKey("millingType"))
+                        md.SurfaceMillingType = (short)(GetString(prms, "millingType", "climb").ToLowerInvariant() == "conventional" ? 1 : 0);
+                    if (prms.ContainsKey("clockwise")) md.SurfaceMCCW = GetBool(prms, "clockwise", false);
+                    if (prms.ContainsKey("upperZ")) md.SurfaceMCUpperZ = GetDouble(prms, "upperZ");
+                    if (prms.ContainsKey("lowerZ")) md.SurfaceMCLowerZ = GetDouble(prms, "lowerZ");
+                    if (prms.ContainsKey("cutInnerSurfaces")) md.SurfaceMCCutInnerSurfaces = GetBool(prms, "cutInnerSurfaces", false);
+                    if (prms.ContainsKey("toolCanUndercut")) md.SurfaceMCToolCanUndercut = GetBool(prms, "toolCanUndercut", false);
+                    if (prms.ContainsKey("checkFoulNonMachined")) md.CheckFoulNonMachinedSurfacesOrSolids = GetBool(prms, "checkFoulNonMachined", false);
+                    if (prms.ContainsKey("checkFoulCurrentSurface")) md.CheckFoulCurrentSurface = GetBool(prms, "checkFoulCurrentSurface", false);
+                    if (prms.ContainsKey("checkFoulOtherMachined")) md.CheckFoulOtherMachinedSurfaces = GetBool(prms, "checkFoulOtherMachined", false);
+
+                    // Rest machining (strategy=restMachining).
+                    if (prms.ContainsKey("restType"))
+                    {
+                        var rt = GetString(prms, "restType", "auto").ToLowerInvariant();
+                        md.SurfaceRestMCType = (short)(rt.StartsWith("paralleltocorner") ? 0 : rt.StartsWith("acrosscorner") ? 1 : rt.StartsWith("pencil") ? 2 : 3);
+                    }
+                    if (prms.ContainsKey("previousToolDiameter")) md.SurfaceRestMCPrevToolDia = GetDouble(prms, "previousToolDiameter");
+
+                    // Radial / spiral extents.
+                    if (prms.ContainsKey("startAngle")) md.StartAngle = GetDouble(prms, "startAngle");
+                    if (prms.ContainsKey("endAngle")) md.EndAngle = GetDouble(prms, "endAngle");
+                    if (prms.ContainsKey("stepAngle")) md.StepAngle = GetDouble(prms, "stepAngle");
+                    if (prms.ContainsKey("innerRadius")) md.InnerRadius = GetDouble(prms, "innerRadius");
+                    if (prms.ContainsKey("outerRadius")) md.OuterRadius = GetDouble(prms, "outerRadius");
+
+                    // Leads and links.
+                    if (prms.ContainsKey("leadsAndLinks")) md.SurfaceMCLeadAndLinks = GetBool(prms, "leadsAndLinks", false);
+                    if (prms.ContainsKey("leadArcRadius")) md.SurfaceMCLeadArcRadius = GetDouble(prms, "leadArcRadius");
+                    if (prms.ContainsKey("leadExtensionLength")) md.SurfaceMCLeadExtensionLength = GetDouble(prms, "leadExtensionLength");
+                    if (prms.ContainsKey("leadRampAngle")) md.SurfaceMCLeadRampAngle = GetDouble(prms, "leadRampAngle");
+                    if (prms.ContainsKey("leadRampLength")) md.SurfaceMCLeadRampLength = GetDouble(prms, "leadRampLength");
+                    if (prms.ContainsKey("smoothLinks")) md.SurfaceMCLeadSmoothLinks = GetBool(prms, "smoothLinks", false);
+
+                    // Feeds.
+                    if (prms.ContainsKey("feedRate")) md.CutFeed = (float)GetDouble(prms, "feedRate", 0);
+                    if (prms.ContainsKey("spindleSpeed")) md.SpindleSpeed = (float)GetDouble(prms, "spindleSpeed", 0);
+                    if (prms.ContainsKey("downFeed")) md.DownFeed = (float)GetDouble(prms, "downFeed", 0);
+                    if (prms.ContainsKey("feedDownDistance")) md.FeedDownDistance = (float)GetDouble(prms, "feedDownDistance", 0);
+
+                    // Containment boundary (closed geometries), drive curve, start points.
+                    int boundaryCount = 0;
+                    if (prms.ContainsKey("boundaryGeometryIds") || prms.ContainsKey("boundaryGeometryId"))
+                    {
+                        var bprm = new Dictionary<string, object>();
+                        if (prms.ContainsKey("boundaryGeometryIds")) bprm["geometryIds"] = prms["boundaryGeometryIds"];
+                        if (prms.ContainsKey("boundaryGeometryId")) bprm["geometryId"] = prms["boundaryGeometryId"];
+                        var blist = ResolveGeometryList(bprm);
+                        dynamic bcoll = drw.CreatePathCollection();
+                        foreach (var kv in blist) { bcoll.Add(kv.Value); boundaryCount++; }
+                        md.SetSurfaceMCBoundary(bcoll);
+                        if (haveModelBounds)
+                        {
+                            double bMinX = double.PositiveInfinity, bMinY = double.PositiveInfinity, bMaxX = double.NegativeInfinity, bMaxY = double.NegativeInfinity;
+                            foreach (var kv in blist)
+                            {
+                                double gx0, gy0, gx1, gy1;
+                                try { GeometryBounds(kv.Value, out gx0, out gy0, out gx1, out gy1); } catch { continue; }
+                                bMinX = Math.Min(bMinX, gx0); bMinY = Math.Min(bMinY, gy0); bMaxX = Math.Max(bMaxX, gx1); bMaxY = Math.Max(bMaxY, gy1);
+                            }
+                            double slack = toolDia; // a boundary this far inside the footprint leaves visible material
+                            if (bMinX > mMinX + slack || bMinY > mMinY + slack || bMaxX < mMaxX - slack || bMaxY < mMaxY - slack)
+                                warnings.Add("The boundary (" + Math.Round(bMinX, 3) + "," + Math.Round(bMinY, 3) + ")-(" + Math.Round(bMaxX, 3) + "," + Math.Round(bMaxY, 3) + ") is smaller than the model footprint (" + Math.Round(mMinX, 3) + "," + Math.Round(mMinY, 3) + ")-(" + Math.Round(mMaxX, 3) + "," + Math.Round(mMaxY, 3) + "): material outside it is NOT touched by this operation" + (roughing ? "." : " — roughing terraces there will remain unless another operation covers them."));
+                        }
+                    }
+                    if (prms.ContainsKey("driveCurveGeometryId"))
+                    {
+                        object dc;
+                        var dcId = GetString(prms, "driveCurveGeometryId", "");
+                        if (!_objectCache.TryGetValue(dcId, out dc)) throw new InvalidOperationException("driveCurveGeometryId " + dcId + " not found");
+                        md.SetSurfaceDriveCurve(dc);
+                    }
+                    if (prms.ContainsKey("startPoint") && prms.ContainsKey("directionPoint"))
+                    {
+                        var sp = prms["startPoint"] as Dictionary<string, object>;
+                        var dp = prms["directionPoint"] as Dictionary<string, object>;
+                        if (sp == null || dp == null) throw new ArgumentException("startPoint/directionPoint must be {x,y,z} objects");
+                        md.SetSurfaceMCPoints(GetDouble(sp, "x", 0), GetDouble(sp, "y", 0), GetDouble(sp, "z", 0),
+                                              GetDouble(dp, "x", 0), GetDouble(dp, "y", 0), GetDouble(dp, "z", 0));
+                    }
+
+                    // Escape hatch: any MillData property by name.
+                    var applied = new List<string>();
+                    if (prms.ContainsKey("millDataProperties"))
+                    {
+                        var extra = prms["millDataProperties"] as Dictionary<string, object>;
+                        if (extra != null) foreach (var kv in extra) { SetInterfaceProperty(typeof(IMillData), (object)md, kv.Key, kv.Value); applied.Add(kv.Key); }
+                    }
+
+                    // Which engine: the classic surface machining code, or the
+                    // "Machining Engine" (V9/Planit) used by the modern 3D
+                    // roughing dialog. Roughing defaults to the engine.
+                    var engine = GetString(prms, "engine", roughing ? "machiningEngine" : "classic").ToLowerInvariant();
+                    bool useEngine = engine.StartsWith("machining") || engine == "engine" || engine == "v9";
+                    dynamic runner = md;
+                    var engineApplied = new List<string>();
+                    string stockMode = null;
+                    if (stockObj != null && !useEngine)
+                    {
+                        // Classic engine: Alphacam reads "the currently selected
+                        // STL or Solid" at the moment of the call — select the
+                        // stock alone, register it, then re-select the targets.
+                        int s1, s2;
+                        Set3DSelection(drw, new List<KeyValuePair<string, object>> { new KeyValuePair<string, object>(stockId, stockObj) }, out s1, out s2);
+                        md.SetStlOrSolidAsMaterial();
+                        Set3DSelection(drw, targets, out solidsSelected, out surfacesSelected);
+                        stockMode = "MillData.SetStlOrSolidAsMaterial";
+                    }
+                    if (useEngine)
+                    {
+                        dynamic me = md.MillDataMachiningEngine;
+                        if (stockObj != null)
+                        {
+                            // Machining Engine: SetStlOrSolidAsMaterial is
+                            // refused ("should not be used with
+                            // MillDataMachiningEngine"); pass the stock through
+                            // SetMaterials(AlphacamObjects) instead. Found 2026-09-29.
+                            dynamic mats = drw.CreateAlphacamObjectsCollection();
+                            mats.Add(stockObj);
+                            me.SetMaterials(mats);
+                            stockMode = "MillDataMachiningEngine.SetMaterials";
+                        }
+                        if (prms.ContainsKey("millType"))
+                        {
+                            var mt = GetString(prms, "millType", "climb").ToLowerInvariant();
+                            me.MillType = (short)(mt == "conventional" ? 1 : mt.StartsWith("optimi") ? 2 : 0);
+                        }
+                        if (prms.ContainsKey("approachType"))
+                        {
+                            var at = GetString(prms, "approachType", "automatic").ToLowerInvariant();
+                            me.ApproachType = (short)(at.StartsWith("predrill") ? 1 : at == "helix" ? 2 : at == "ramp" ? 3 : 0);
+                        }
+                        if (prms.ContainsKey("rampAngle")) me.RampAngle = GetDouble(prms, "rampAngle");
+                        if (prms.ContainsKey("feedWhenPlunging")) me.FeedWhenPlunging = GetBool(prms, "feedWhenPlunging", false);
+                        if (prms.ContainsKey("widthOfCutCleanUp")) me.WidthOfCutCleanUp = GetDouble(prms, "widthOfCutCleanUp");
+                        if (prms.ContainsKey("intermediateMaxDepthPerCut")) me.IntermediateMaxDepthPerCut = GetDouble(prms, "intermediateMaxDepthPerCut");
+                        if (prms.ContainsKey("intermediateWidthOfCut")) me.IntermediateWidthOfCut = GetDouble(prms, "intermediateWidthOfCut");
+                        if (prms.ContainsKey("highSpeedCornering")) me.HighSpeedCornering = GetBool(prms, "highSpeedCornering", false);
+                        if (prms.ContainsKey("trochoidal")) me.Trochoidal = GetBool(prms, "trochoidal", false);
+                        if (prms.ContainsKey("closeOpenPockets")) me.CloseOpenPockets = GetBool(prms, "closeOpenPockets", false);
+                        if (prms.ContainsKey("avoidRollover")) me.AvoidRollover = GetBool(prms, "avoidRollover", false);
+                        if (prms.ContainsKey("xyStandOff")) me.XYStandOff = GetDouble(prms, "xyStandOff");
+                        if (prms.ContainsKey("minimumRadius")) me.MinimumRadius = GetDouble(prms, "minimumRadius");
+                        if (prms.ContainsKey("maxPlungeDepth")) me.MaxPlungeDepth = GetDouble(prms, "maxPlungeDepth");
+                        if (prms.ContainsKey("engineProperties"))
+                        {
+                            var extra = prms["engineProperties"] as Dictionary<string, object>;
+                            if (extra != null) foreach (var kv in extra) { SetInterfaceProperty(typeof(IMillDataMachiningEngine), (object)me, kv.Key, kv.Value); engineApplied.Add(kv.Key); }
+                        }
+                        runner = me;
+                    }
+
+                    // Pick the call by what is selected: solids only →
+                    // MachineSolid, surfaces only → MachineSurfaces, mixed →
+                    // MachineSolidsAndSurfaces.
+                    string call;
+                    dynamic paths;
+                    if (solidsSelected > 0 && surfacesSelected == 0) { call = "MachineSolid"; paths = runner.MachineSolid(); }
+                    else if (surfacesSelected > 0 && solidsSelected == 0) { call = "MachineSurfaces"; paths = runner.MachineSurfaces(); }
+                    else { call = "MachineSolidsAndSurfaces"; paths = runner.MachineSolidsAndSurfaces(); }
+
+                    var pathIds = StorePathsCollection(paths);
+                    int elemTotal = 0; double lenTotal = 0, timeTotal = 0;
+                    double tpMinZ = double.PositiveInfinity, tpMaxZ = double.NegativeInfinity;
+                    double tpMinX = double.PositiveInfinity, tpMinY = double.PositiveInfinity, tpMaxX = double.NegativeInfinity, tpMaxY = double.NegativeInfinity;
+                    int elemsScanned = 0; const int ElemScanCap = 40000;
+                    try
+                    {
+                        int pc = (int)paths.Count;
+                        for (int i = 1; i <= pc; i++)
+                        {
+                            dynamic p = paths.Item(i);
+                            try { elemTotal += (int)p.GetElemCount(); } catch { }
+                            try { lenTotal += (double)p.Length; } catch { }
+                            try { timeTotal += (double)p.TimeForToolPath; } catch { }
+                            try
+                            {
+                                double fx0, fy0, fx1, fy1;
+                                fx0 = fy0 = fx1 = fy1 = 0;
+                                p.GetFeedExtent(ref fx0, ref fy0, ref fx1, ref fy1);
+                                tpMinX = Math.Min(tpMinX, fx0); tpMinY = Math.Min(tpMinY, fy0); tpMaxX = Math.Max(tpMaxX, fx1); tpMaxY = Math.Max(tpMaxY, fy1);
+                            }
+                            catch { }
+                            // Feed-move Z range (rapids excluded), capped so a
+                            // huge finish doesn't stall the response.
+                            if (elemsScanned < ElemScanCap)
+                            {
+                                try
+                                {
+                                    // Bound by the path's own element count:
+                                    // GetNext wraps around on closed paths.
+                                    int pathElems = 0; try { pathElems = (int)p.GetElemCount(); } catch { }
+                                    dynamic e = p.GetFirstElem();
+                                    int walked = 0;
+                                    while (e != null && elemsScanned < ElemScanCap && walked < pathElems)
+                                    {
+                                        elemsScanned++; walked++;
+                                        bool rapid = false; try { rapid = (bool)e.IsRapid; } catch { }
+                                        if (!rapid)
+                                        {
+                                            double z0 = (double)e.StartZG, z1 = (double)e.EndZG;
+                                            tpMinZ = Math.Min(tpMinZ, Math.Min(z0, z1)); tpMaxZ = Math.Max(tpMaxZ, Math.Max(z0, z1));
+                                        }
+                                        e = e.GetNext();
+                                    }
+                                }
+                                catch { }
+                            }
+                        }
+                    }
+                    catch { }
+                    if (haveModelBounds && !double.IsInfinity(tpMinZ))
+                    {
+                        if (roughing)
+                        {
+                            double stockZv = GetDouble(prms, "stockZ", GetDouble(prms, "stock", 0.0));
+                            // The relevant floor is the lowest point of the
+                            // model's TOP surface (what a 3-axis tool can
+                            // reach), not the solid's minZ (its underside).
+                            double topMin = ModelTopSurfaceMinZ(drw, solidsSelected > 0, targets);
+                            if (double.IsNaN(topMin)) topMin = mMinZ;
+                            double floorGap = tpMinZ - (topMin + stockZv);
+                            if (floorGap > 0.02 * Math.Max(1.0, mMaxZ - mMinZ) + 1e-6)
+                                warnings.Add("Roughing floor is Z " + Math.Round(tpMinZ, 4) + " but the lowest point of the model's top surface + stockZ is " + Math.Round(topMin + stockZv, 4) + ": up to " + Math.Round(floorGap, 4) + " of material stays above the model in its low areas. Use a smaller maxDepthPerCut, intermediateMaxDepthPerCut, or make sure a finishing pass covers those areas.");
+                            res3d_topMin = topMin;
+                        }
+                        else
+                        {
+                            double below = mMinZ - tpMinZ;
+                            if (below > 0.25 * toolDia)
+                                warnings.Add("The tool tip reaches Z " + Math.Round(tpMinZ, 4) + ", " + Math.Round(below, 4) + " below the model's lowest point (" + Math.Round(mMinZ, 4) + "): it is rolling over the model's outer edge. Leave margin stock around the part, contain the operation with a boundary, or accept the roll-off.");
+                        }
+                        if (!double.IsInfinity(tpMinX))
+                        {
+                            double m = toolDia; // uncovered margin larger than a tool diameter is a real gap
+                            if (tpMinX > mMinX + m || tpMinY > mMinY + m || tpMaxX < mMaxX - m || tpMaxY < mMaxY - m)
+                                warnings.Add("Toolpaths span (" + Math.Round(tpMinX, 3) + "," + Math.Round(tpMinY, 3) + ")-(" + Math.Round(tpMaxX, 3) + "," + Math.Round(tpMaxY, 3) + ") but the model footprint is (" + Math.Round(mMinX, 3) + "," + Math.Round(mMinY, 3) + ")-(" + Math.Round(mMaxX, 3) + "," + Math.Round(mMaxY, 3) + "): part of the model is not covered by this operation.");
+                        }
+                    }
+                    try { drw.Redraw(); } catch { }
+
+                    var res3d = new Dictionary<string, object>
+                    {
+                        ["strategy"] = strategy,
+                        ["action"] = roughing ? "roughing" : "finishing",
+                        ["surfaceMCMethod"] = (int)methodCode,
+                        ["engine"] = useEngine ? "machiningEngine" : "classic",
+                        ["call"] = call,
+                        ["solidsSelected"] = solidsSelected,
+                        ["surfacesSelected"] = surfacesSelected,
+                        ["boundaryCount"] = boundaryCount,
+                        ["toolDiameter"] = toolDia,
+                        ["stepover"] = stepover,
+                        ["chordError"] = (double)md.ChordError,
+                        ["safeRapidLevel"] = (double)md.SafeRapidLevel,
+                        ["rapidDownTo"] = (double)md.RapidDownTo,
+                        ["pathIds"] = pathIds.Count > 40 ? pathIds.GetRange(0, 40) : pathIds,
+                        ["pathIdsTruncated"] = pathIds.Count > 40,
+                        ["pathCount"] = pathIds.Count,
+                        ["elementCount"] = elemTotal,
+                        ["totalLength"] = lenTotal,
+                        ["timeForToolPath"] = timeTotal,
+                        ["toolPathCount"] = (int)drw.GetToolPathCount(),
+                        ["message"] = "3D " + (roughing ? "roughing" : strategy) + " completed via " + call
+                    };
+                    if (stockMode != null) res3d["stockModel"] = new Dictionary<string, object> { ["modelId"] = stockId, ["via"] = stockMode };
+                    if (applied.Count > 0) res3d["millDataPropertiesApplied"] = applied;
+                    if (engineApplied.Count > 0) res3d["enginePropertiesApplied"] = engineApplied;
+                    if (pathIds.Count == 0) warnings.Add("Alphacam returned no toolpaths — check that the models sit within Z range of the tool, the boundary (if any) overlaps them, and the strategy applies to this model type.");
+                    if (haveModelBounds) res3d["modelBounds"] = new Dictionary<string, object> { ["minX"] = mMinX, ["minY"] = mMinY, ["minZ"] = mMinZ, ["maxX"] = mMaxX, ["maxY"] = mMaxY, ["maxZ"] = mMaxZ };
+                    if (!double.IsNaN(res3d_topMin)) res3d["modelTopSurfaceMinZ"] = Math.Round(res3d_topMin, 4);
+                    if (!double.IsInfinity(tpMinZ)) res3d["toolpathZRange"] = new Dictionary<string, object> { ["min"] = Math.Round(tpMinZ, 4), ["max"] = Math.Round(tpMaxZ, 4), ["elementsScanned"] = elemsScanned, ["capped"] = elemsScanned >= ElemScanCap };
+                    if (!double.IsInfinity(tpMinX)) res3d["toolpathXYExtent"] = new Dictionary<string, object> { ["minX"] = Math.Round(tpMinX, 4), ["minY"] = Math.Round(tpMinY, 4), ["maxX"] = Math.Round(tpMaxX, 4), ["maxY"] = Math.Round(tpMaxY, 4) };
+                    if (warnings.Count > 0) res3d["warnings"] = warnings;
+                    res3d["nextStep"] = "Run alphacam_simulate to compare the simulated stock against the model before posting.";
+                    return res3d;
+                }
+
+                case "alphacam.simulate":
+                {
+                    // Closed loop for 3D work: run Alphacam's solid simulation,
+                    // export the resulting stock as STL, export the model as
+                    // STL, and compare them top-down (StlCompare). Verified
+                    // 2026-09-29: SolidSimulation(false) returns 0 (OK) and
+                    // GetUpdatedStockSTL writes <name>.1.stl (binary).
+                    dynamic drw = _app.ActiveDrawing;
+                    int tpCount = 0; try { tpCount = (int)drw.GetToolPathCount(); } catch { }
+                    if (tpCount == 0) throw new InvalidOperationException("No toolpaths to simulate");
+                    string outDir = GetString(prms, "outputDir", "");
+                    if (string.IsNullOrEmpty(outDir))
+                    {
+                        try { outDir = (string)drw.Path; } catch { }
+                        if (string.IsNullOrEmpty(outDir)) outDir = Path.Combine(Path.GetTempPath(), "AlphacamBridge");
+                    }
+                    Directory.CreateDirectory(outDir);
+                    string baseName = GetString(prms, "name", "");
+                    if (string.IsNullOrEmpty(baseName))
+                    {
+                        try { baseName = Path.GetFileNameWithoutExtension((string)drw.Name); } catch { }
+                        if (string.IsNullOrEmpty(baseName)) baseName = "simulation";
+                    }
+                    double tol = GetDouble(prms, "tolerance", 0.002);
+                    double cmpTol = GetDouble(prms, "deviationTolerance", 0.01);
+                    int grid = Math.Max(50, Math.Min(600, GetInt(prms, "gridSize", 200)));
+                    bool showTools = GetBool(prms, "showTools", false);
+                    bool keepOpen = GetBool(prms, "keepSimulationOpen", false);
+                    bool compare = GetBool(prms, "compare", true);
+
+                    var sw = System.Diagnostics.Stopwatch.StartNew();
+                    int simResult = (int)drw.SolidSimulation(showTools);
+                    string[] simNames = { "OK", "NoMaterial", "NoDefaultMaterial", "DLLError", "InitError", "Clash", "InvalidTool", "GeneralError", "InvalidTurretGroup" };
+                    string simName = simResult >= 0 && simResult < simNames.Length ? simNames[simResult] : simResult.ToString();
+                    var simRes = new Dictionary<string, object>
+                    {
+                        ["simulationResult"] = simResult, ["simulationResultName"] = simName,
+                        ["toolPathCount"] = tpCount, ["simulationSeconds"] = Math.Round(sw.Elapsed.TotalSeconds, 1)
+                    };
+                    if (simResult != 0)
+                    {
+                        try { if (!keepOpen) drw.CloseSolidSimulation(); } catch { }
+                        if (simResult == 1 || simResult == 2) simRes["hint"] = "Define the material first (alphacam_specify_panel or alphacam_specify_material) — the simulation needs a stock definition.";
+                        simRes["message"] = "Solid simulation did not run: " + simName;
+                        return simRes;
+                    }
+
+                    // Export the simulated stock. Alphacam appends ".<index>" to
+                    // the name; pick the newest matching file.
+                    string stockName = baseName + "-stock";
+                    foreach (var old in Directory.GetFiles(outDir, stockName + "*.stl")) { try { File.Delete(old); } catch { } }
+                    int stockCount = (int)drw.GetUpdatedStockSTL(outDir, stockName, false, 1.0, tol);
+                    string stockPath = null; DateTime newest = DateTime.MinValue;
+                    foreach (var f in Directory.GetFiles(outDir, stockName + "*.stl"))
+                    {
+                        var t = File.GetLastWriteTime(f);
+                        if (t > newest) { newest = t; stockPath = f; }
+                    }
+                    simRes["stockCount"] = stockCount;
+                    simRes["stockStlPath"] = stockPath;
+                    try { if (!keepOpen) drw.CloseSolidSimulation(); } catch (Exception ex) { Log("CloseSolidSimulation: " + ex.Message); }
+                    if (stockPath == null) { simRes["message"] = "Simulation ran but no stock STL was written"; return simRes; }
+                    if (!compare) { simRes["message"] = "Simulation complete; stock exported"; return simRes; }
+
+                    // Export the model: STL solids (type 1) or surfaces (type 2).
+                    // Scope: modelIds if given, else every solid/surface except
+                    // ones that were used as a stock model in machine_3d
+                    // (SaveStlFile honours Visible, so the others are hidden
+                    // during the export).
+                    List<KeyValuePair<string, object>> cmpModels;
+                    if (prms.ContainsKey("modelIds") || prms.ContainsKey("modelId")) cmpModels = Resolve3DModels(prms, drw);
+                    else
+                    {
+                        cmpModels = new List<KeyValuePair<string, object>>();
+                        cmpModels.AddRange(EnumerateSolidParts(drw)); cmpModels.AddRange(EnumerateSurfaces(drw));
+                        cmpModels.RemoveAll(kv => _stockModels.Exists(o => SameModel(o, kv.Value)));
+                    }
+                    if (cmpModels.Count == 0) { simRes["message"] = "Simulation complete; no 3D model in the drawing to compare against (pass modelIds if only stock models are loaded)"; return simRes; }
+                    int solids = cmpModels.FindAll(kv => AsSolidPart(kv.Value) != null).Count;
+                    string modelPath = Path.Combine(outDir, baseName + "-model.stl");
+                    ExportModelsStl(drw, modelPath, solids > 0 ? 1 : 2, tol, cmpModels);
+                    simRes["modelStlPath"] = modelPath;
+                    simRes["comparedModelIds"] = cmpModels.ConvertAll(kv => kv.Key);
+
+                    var model = StlCompare.ReadStl(modelPath);
+                    var stock = StlCompare.ReadStl(stockPath);
+                    var rep = StlCompare.Compare(model, stock, grid, cmpTol, GetInt(prms, "worstSpots", 6));
+                    double mx0, my0, mz0, mx1, my1, mz1; StlCompare.Bounds(model, out mx0, out my0, out mz0, out mx1, out my1, out mz1);
+                    var spotsR = new List<object>(); foreach (var s in rep.WorstRemaining) spotsR.Add(new Dictionary<string, object> { ["x"] = s.X, ["y"] = s.Y, ["remaining"] = s.Value, ["modelZ"] = s.ModelZ, ["stockZ"] = s.StockZ });
+                    var spotsG = new List<object>(); foreach (var s in rep.WorstGouges) spotsG.Add(new Dictionary<string, object> { ["x"] = s.X, ["y"] = s.Y, ["gouge"] = s.Value, ["modelZ"] = s.ModelZ, ["stockZ"] = s.StockZ });
+                    simRes["comparison"] = new Dictionary<string, object>
+                    {
+                        ["method"] = "top-down height map (3-axis)",
+                        ["gridSize"] = grid,
+                        ["deviationTolerance"] = cmpTol,
+                        ["modelTriangles"] = model.Count, ["stockTriangles"] = stock.Count,
+                        ["modelBounds"] = new Dictionary<string, object> { ["minX"] = mx0, ["minY"] = my0, ["minZ"] = mz0, ["maxX"] = mx1, ["maxY"] = my1, ["maxZ"] = mz1 },
+                        ["coveredCells"] = rep.CoveredCells,
+                        ["maxRemaining"] = Math.Round(rep.MaxRemaining, 4),
+                        ["meanRemaining"] = Math.Round(rep.MeanRemaining, 4),
+                        ["maxGouge"] = Math.Round(rep.MaxGouge, 4),
+                        ["meanGouge"] = Math.Round(rep.MeanGouge, 4),
+                        ["pctWithinTolerance"] = Math.Round(rep.PctWithinTolerance, 1),
+                        ["pctRemainingAboveTolerance"] = Math.Round(rep.PctRemainingAboveTolerance, 1),
+                        ["pctGougeBeyondTolerance"] = Math.Round(rep.PctGougeBeyondTolerance, 1),
+                        ["areaRemainingAboveTolerance"] = Math.Round(rep.AreaRemainingAboveTolerance, 3),
+                        ["worstRemaining"] = spotsR,
+                        ["worstGouges"] = spotsG,
+                    };
+                    string verdict;
+                    if (rep.MaxGouge > cmpTol) verdict = "GOUGE: the stock is cut below the model by up to " + Math.Round(rep.MaxGouge, 4) + " — check tool, stock/safe levels and rollover at edges.";
+                    else if (rep.PctRemainingAboveTolerance > 1.0) verdict = "INCOMPLETE: " + Math.Round(rep.PctRemainingAboveTolerance, 1) + "% of the footprint still carries more than " + cmpTol + " of material (max " + Math.Round(rep.MaxRemaining, 4) + ") — see worstRemaining for where.";
+                    else verdict = "OK: within " + cmpTol + " over " + Math.Round(rep.PctWithinTolerance, 1) + "% of the footprint (max remaining " + Math.Round(rep.MaxRemaining, 4) + ").";
+                    simRes["verdict"] = verdict;
+                    simRes["totalSeconds"] = Math.Round(sw.Elapsed.TotalSeconds, 1);
+                    simRes["message"] = "Simulation complete";
+                    return simRes;
+                }
+
+                case "alphacam.api_invoke":
+                {
+                    // Batch mode: calls:[{target,member,kind,args,byRef}, ...]
+                    // runs sequentially in ONE round-trip (one MCP permission
+                    // prompt). Later calls can reference earlier results with
+                    // {"$ref": i} (i = zero-based index of the call whose
+                    // result handle to use) as target or inside args.
+                    if (prms.ContainsKey("calls"))
+                    {
+                        var calls = prms["calls"] as System.Collections.ArrayList;
+                        if (calls == null || calls.Count == 0) throw new ArgumentException("calls must be a non-empty array");
+                        bool continueOnError = GetBool(prms, "continueOnError", false);
+                        var results = new List<object>();
+                        var handles = new List<string>();
+                        for (int ci = 0; ci < calls.Count; ci++)
+                        {
+                            var call = calls[ci] as Dictionary<string, object>;
+                            if (call == null) throw new ArgumentException("calls[" + ci + "] is not an object");
+                            var resolved = new Dictionary<string, object>(call);
+                            resolved["target"] = ResolveBatchRef(call.ContainsKey("target") ? call["target"] : "app", handles, ci);
+                            if (call.ContainsKey("args"))
+                            {
+                                var rawArgs = call["args"] as System.Collections.ArrayList;
+                                if (rawArgs != null)
+                                {
+                                    var newArgs = new System.Collections.ArrayList();
+                                    foreach (var a in rawArgs) newArgs.Add(ResolveBatchRefArg(a, handles, ci));
+                                    resolved["args"] = newArgs;
+                                }
+                            }
+                            try
+                            {
+                                var one = InvokeApi(resolved);
+                                results.Add(one);
+                                var r = one.ContainsKey("result") ? one["result"] as Dictionary<string, object> : null;
+                                handles.Add(r != null && r.ContainsKey("objectId") ? Convert.ToString(r["objectId"]) : null);
+                            }
+                            catch (Exception ex)
+                            {
+                                results.Add(new Dictionary<string, object> { ["error"] = ex.Message, ["call"] = ci });
+                                handles.Add(null);
+                                if (!continueOnError)
+                                    return new Dictionary<string, object> { ["results"] = results, ["completed"] = ci, ["failedAt"] = ci, ["error"] = ex.Message };
+                            }
+                        }
+                        return new Dictionary<string, object> { ["results"] = results, ["completed"] = calls.Count };
+                    }
+                    return InvokeApi(prms);
                 }
 
                 case "alphacam.api_inspect":
@@ -2263,6 +2968,16 @@ namespace CambotAlphacam
                     var target = ResolveApiTarget(targetStr);
                     var typeName = GetComTypeName(target);
                     var d = new Dictionary<string, object> { ["target"] = targetStr, ["comType"] = typeName };
+                    if (typeName == "_ComObject")
+                    {
+                        var probed = ProbeInteropInterface(target);
+                        if (probed != null)
+                        {
+                            typeName = probed.Name;
+                            d["comType"] = typeName;
+                            d["note"] = "Add-in object without a registered type library; members resolved by QueryInterface to the interop interface " + typeName + " (calls go through the vtable).";
+                        }
+                    }
                     var members = DescribeInteropType(typeName);
                     if (members != null)
                     {
@@ -2301,6 +3016,536 @@ namespace CambotAlphacam
                 default:
                     throw new InvalidOperationException("Unknown method: " + method);
             }
+        }
+
+        // ── 3D model helpers ────────────────────────────────────────
+
+        // Solid parts (STL / Parasolid / STEP-as-solid) in the drawing, as
+        // (cachedId, comObject). SolidPart objects come from an add-in and
+        // must be driven through the interop interface, not IDispatch.
+        private List<KeyValuePair<string, object>> EnumerateSolidParts(dynamic drw, bool cache = true)
+        {
+            var list = new List<KeyValuePair<string, object>>();
+            try
+            {
+                dynamic parts = drw.SolidParts;
+                int n = (int)parts.Count;
+                for (int i = 1; i <= n; i++)
+                {
+                    object p = parts.Item(i);
+                    list.Add(new KeyValuePair<string, object>(cache ? StoreObject(p) : ("solid_" + i), p));
+                }
+            }
+            catch (Exception ex) { Log("EnumerateSolidParts: " + ex.Message); }
+            return list;
+        }
+
+        private List<KeyValuePair<string, object>> EnumerateSurfaces(dynamic drw, bool cache = true)
+        {
+            var list = new List<KeyValuePair<string, object>>();
+            try
+            {
+                dynamic surfs = drw.Surfaces;
+                int n = (int)surfs.Count;
+                for (int i = 1; i <= n; i++)
+                {
+                    object s = surfs.Item(i);
+                    list.Add(new KeyValuePair<string, object>(cache ? StoreObject(s) : ("surface_" + i), s));
+                }
+            }
+            catch (Exception ex) { Log("EnumerateSurfaces: " + ex.Message); }
+            return list;
+        }
+
+        private Dictionary<string, object> DescribeSolidPart(string id, object obj)
+        {
+            var d = new Dictionary<string, object> { ["modelId"] = id, ["kind"] = "solid" };
+            var sp = AsSolidPart(obj);
+            if (sp == null) { d["error"] = "ISolidPart QueryInterface failed"; return d; }
+            try { d["name"] = sp.Name; } catch { }
+            try { d["visible"] = sp.Visible; } catch { }
+            try { d["selected"] = sp.Selected; } catch { }
+            try
+            {
+                d["minX"] = sp.MinX; d["minY"] = sp.MinY; d["minZ"] = sp.MinZ;
+                d["maxX"] = sp.MaxX; d["maxY"] = sp.MaxY; d["maxZ"] = sp.MaxZ;
+                d["sizeX"] = sp.MaxX - sp.MinX; d["sizeY"] = sp.MaxY - sp.MinY; d["sizeZ"] = sp.MaxZ - sp.MinZ;
+            }
+            catch { }
+            try { var layer = sp.GetLayer(); if (layer != null) d["layer"] = ((dynamic)layer).Name; } catch { }
+            return d;
+        }
+
+        private Dictionary<string, object> DescribeSurface(string id, object obj)
+        {
+            var d = new Dictionary<string, object> { ["modelId"] = id, ["kind"] = "surface" };
+            var su = AsSurface(obj);
+            if (su == null) { d["error"] = "ISurface QueryInterface failed"; return d; }
+            try { d["visible"] = su.Visible; } catch { }
+            try { d["selected"] = su.Selected; } catch { }
+            try { d["trimmed"] = su.Trimmed; } catch { }
+            try { d["group"] = su.Group; } catch { }
+            try
+            {
+                d["minX"] = su.MinX; d["minY"] = su.MinY; d["minZ"] = su.MinZ;
+                d["maxX"] = su.MaxX; d["maxY"] = su.MaxY; d["maxZ"] = su.MaxZ;
+            }
+            catch { }
+            try { var layer = su.GetLayer(); if (layer != null) d["layer"] = ((dynamic)layer).Name; } catch { }
+            return d;
+        }
+
+        private static bool GetModelSelected(object obj)
+        {
+            var sp = AsSolidPart(obj);
+            if (sp != null) { try { return sp.Selected; } catch { return false; } }
+            var su = AsSurface(obj);
+            if (su != null) { try { return su.Selected; } catch { return false; } }
+            try { dynamic d = obj; return (bool)d.Selected; } catch { return false; }
+        }
+
+        private static void SetModelSelected(object obj, bool value)
+        {
+            var sp = AsSolidPart(obj);
+            if (sp != null) { sp.Selected = value; return; }
+            var su = AsSurface(obj);
+            if (su != null) { su.Selected = value; return; }
+            dynamic d = obj; d.Selected = value;
+        }
+
+        // Union bounding box of solids/surfaces (via the interop interfaces).
+        private static void ModelBounds(List<KeyValuePair<string, object>> models, out double minX, out double minY, out double minZ, out double maxX, out double maxY, out double maxZ)
+        {
+            minX = minY = minZ = double.PositiveInfinity; maxX = maxY = maxZ = double.NegativeInfinity;
+            foreach (var kv in models)
+            {
+                try
+                {
+                    var sp = AsSolidPart(kv.Value);
+                    if (sp != null)
+                    {
+                        minX = Math.Min(minX, sp.MinX); minY = Math.Min(minY, sp.MinY); minZ = Math.Min(minZ, sp.MinZ);
+                        maxX = Math.Max(maxX, sp.MaxX); maxY = Math.Max(maxY, sp.MaxY); maxZ = Math.Max(maxZ, sp.MaxZ);
+                        continue;
+                    }
+                    var su = AsSurface(kv.Value);
+                    if (su != null)
+                    {
+                        minX = Math.Min(minX, su.MinX); minY = Math.Min(minY, su.MinY); minZ = Math.Min(minZ, su.MinZ);
+                        maxX = Math.Max(maxX, su.MaxX); maxY = Math.Max(maxY, su.MaxY); maxZ = Math.Max(maxZ, su.MaxZ);
+                    }
+                }
+                catch { }
+            }
+        }
+
+        // Resolve the 3D models a call targets: modelId/modelIds (from
+        // list_3d_models or import_cad), all:true, selected:true (whatever the
+        // user has highlighted), or interactive:true (Alphacam prompts the user
+        // to pick solids/surfaces).
+        private List<KeyValuePair<string, object>> Resolve3DModels(Dictionary<string, object> prms, dynamic drw)
+        {
+            var all = new List<KeyValuePair<string, object>>();
+            all.AddRange(EnumerateSolidParts(drw));
+            all.AddRange(EnumerateSurfaces(drw));
+
+            if (GetBool(prms, "interactive", false))
+            {
+                var promptText = GetString(prms, "prompt", "Select the 3D models (solids/surfaces) for the agent, then press Enter");
+                // Flags: acamSelectSURFACES (0x200000); ExtraFlags: acamSelectSOLIDS (8).
+                bool ok = false;
+                try { ok = (bool)drw.UserSelectMultiObjects2(promptText, 2097152, 8); }
+                catch (Exception ex) { throw new InvalidOperationException("UserSelectMultiObjects2 failed: " + ex.Message); }
+                if (!ok) throw new InvalidOperationException("User cancelled the selection");
+                var picked = all.FindAll(kv => GetModelSelected(kv.Value));
+                if (picked.Count == 0) throw new InvalidOperationException("User selected no solids or surfaces");
+                return picked;
+            }
+            if (GetBool(prms, "selected", false))
+            {
+                var sel = all.FindAll(kv => GetModelSelected(kv.Value));
+                if (sel.Count == 0) throw new InvalidOperationException("No solids or surfaces are currently selected in Alphacam");
+                return sel;
+            }
+            if (GetBool(prms, "all", false))
+            {
+                if (all.Count == 0) throw new InvalidOperationException("The drawing has no solids or surfaces. Import a model with alphacam_import_cad (asSolid) first.");
+                return all;
+            }
+            var ids = new List<string>();
+            if (prms.ContainsKey("modelIds"))
+            {
+                var arr = prms["modelIds"] as System.Collections.ArrayList;
+                if (arr != null) foreach (var o in arr) { var s = Convert.ToString(o); if (!string.IsNullOrEmpty(s) && !ids.Contains(s)) ids.Add(s); }
+            }
+            if (prms.ContainsKey("modelId"))
+            {
+                var s = GetString(prms, "modelId", "");
+                if (!string.IsNullOrEmpty(s) && !ids.Contains(s)) ids.Add(s);
+            }
+            if (ids.Count == 0)
+            {
+                // Convenience: exactly one model in the drawing → use it.
+                if (all.Count == 1) return all;
+                throw new ArgumentException("Pass modelId/modelIds (from alphacam_list_3d_models), all:true, selected:true, or interactive:true");
+            }
+            var result = new List<KeyValuePair<string, object>>();
+            foreach (var id in ids)
+            {
+                object raw;
+                if (!_objectCache.TryGetValue(id, out raw)) throw new InvalidOperationException("Model " + id + " not found in object cache — call alphacam_list_3d_models");
+                if (AsSolidPart(raw) == null && AsSurface(raw) == null) throw new ArgumentException(id + " is not a solid or surface (it is " + GetComTypeName(raw) + ")");
+                result.Add(new KeyValuePair<string, object>(id, raw));
+            }
+            return result;
+        }
+
+        // Deselect every geometry, solid and surface, then select the given
+        // models. Reports how many of each kind ended up selected.
+        private void Set3DSelection(dynamic drw, List<KeyValuePair<string, object>> targets, out int solids, out int surfaces)
+        {
+            solids = 0; surfaces = 0;
+            try { drw.Geometries.Selected = false; } catch { }
+            foreach (var kv in EnumerateSolidParts(drw, false)) { try { SetModelSelected(kv.Value, false); } catch { } }
+            foreach (var kv in EnumerateSurfaces(drw, false)) { try { SetModelSelected(kv.Value, false); } catch { } }
+            foreach (var kv in targets)
+            {
+                SetModelSelected(kv.Value, true);
+                if (AsSolidPart(kv.Value) != null) solids++; else surfaces++;
+            }
+        }
+
+        // AcamSurfaceMCMethod codes, decoded from the interop 2026-09-29.
+        private static short SurfaceMethodCode(string key)
+        {
+            switch (key)
+            {
+                case "parameterlines": case "parameter": return 0;
+                case "zcontours": case "zcontour": case "waterline": case "zfinish": case "zfinishing": case "horizontal": return 1;
+                case "parallel": case "xy": case "raster": case "lace": case "alonglinexy": return 2;
+                case "projectedcontours": case "projected": case "projectcontours": return 3;
+                case "radial": return 4;
+                case "spiral": return 5;
+                case "restmachining": case "rest": case "pencil": return 6;
+                case "drivecurve": case "drivecurves": case "singledrivecurve": return 7;
+                case "parallelshallow": case "parallelshallowslopes": case "shallow": return 8;
+                case "zcontourssteep": case "zcontoursteep": case "zcontourssteepslopes": case "steep": return 9;
+                case "flatareaoffset": case "flatareas": case "flat": return 10;
+                case "parallelsteep": case "parallelsteepslopes": return 11;
+                case "helicalz": case "helical": return 16;
+                case "zcontoursandflat": case "zcontoursandflatareaoffset": case "zcontoursflat": return 17;
+                case "cylindricalparallel": case "cylindrical": return 18;
+                default:
+                    throw new ArgumentException("Unknown strategy '" + key + "'. Use rough, parallel, zContours, zContoursSteep, parallelShallow, parallelSteep, projectedContours, radial, spiral, restMachining, driveCurve, flatAreaOffset, zContoursAndFlat, helicalZ, cylindricalParallel, or parameterLines.");
+            }
+        }
+
+        // AcamAxis codes: 3=0, 4XZ=1, 4YZ=2, 5=3, 3HELICAL=4, 4XY=5, 3LOCAL=6, 4XY90=7.
+        private static short AxisTypeCode(string s)
+        {
+            var k = (s ?? "3axis").ToLowerInvariant().Replace("-", "").Replace("_", "").Replace(" ", "");
+            switch (k)
+            {
+                case "3": case "3axis": return 0;
+                case "4xz": case "4axisxz": return 1;
+                case "4yz": case "4axisyz": return 2;
+                case "5": case "5axis": return 3;
+                case "3helical": case "3axishelical": return 4;
+                case "4xy": case "4axisxy": return 5;
+                case "3local": case "3axislocal": return 6;
+                case "4xy90": case "4axisxy90": return 7;
+                default: throw new ArgumentException("axisType must be 3axis, 4axisXZ, 4axisYZ, 4axisXY, 4axisXY90, 5axis, 3axisHelical or 3axisLocal");
+            }
+        }
+
+        // Set a named property on a COM object through its interop interface
+        // (exact CLR typing; enums accept ints). Used by the millDataProperties
+        // / engineProperties escape hatches.
+        private void SetInterfaceProperty(Type iface, object target, string name, object value)
+        {
+            var prop = iface.GetProperty(name);
+            if (prop == null || !prop.CanWrite)
+                throw new ArgumentException("'" + name + "' is not a writable property of " + iface.Name + " — check alphacam_api_help");
+            var pt = prop.PropertyType;
+            object v = value;
+            try
+            {
+                if (pt.IsEnum) v = Enum.ToObject(pt, Convert.ToInt32(value));
+                else if (value != null && (pt.IsPrimitive || pt == typeof(decimal) || pt == typeof(string))) v = Convert.ChangeType(value, pt);
+            }
+            catch (Exception ex) { throw new ArgumentException("Cannot convert value for " + name + " to " + pt.Name + ": " + ex.Message); }
+            try { prop.SetValue(target, v, null); }
+            catch (Exception ex)
+            {
+                var inner = (ex is System.Reflection.TargetInvocationException && ex.InnerException != null) ? ex.InnerException : ex;
+                throw new InvalidOperationException("Setting " + iface.Name + "." + name + " failed: " + inner.Message);
+            }
+        }
+
+        // Sloping / profiled sides and Auto-Z multi-level cuts for RoughFinish
+        // and Pocket. Returns a summary for the response, or null when no
+        // side/auto-Z params were given. `helical` guards MaxDepthPerCut,
+        // which rough_finish already uses as the helical pitch.
+        private Dictionary<string, object> ApplySidesAndAutoZ(dynamic md, Dictionary<string, object> prms, bool helical)
+        {
+            bool any = prms.ContainsKey("sides") || prms.ContainsKey("sideAngle") || prms.ContainsKey("sideProfileGeometryId") ||
+                       prms.ContainsKey("autoZ") || prms.ContainsKey("maxDepthPerCut");
+            if (!any) return null;
+            var summary = new Dictionary<string, object>();
+            var sides = GetString(prms, "sides", prms.ContainsKey("sideProfileGeometryId") ? "profiled" : prms.ContainsKey("sideAngle") ? "sloping" : "vertical").ToLowerInvariant();
+            short sidesCode;
+            switch (sides)
+            {
+                case "vertical": sidesCode = 0; break;
+                case "sloping": case "slope": case "taper": case "tapered": sidesCode = 1; break;
+                case "profiled": case "profile": sidesCode = 2; break;
+                case "previoustoolprofile": case "previous": sidesCode = 4; break;
+                case "solidfaces": sidesCode = 5; break;
+                default: throw new ArgumentException("sides must be vertical, sloping or profiled");
+            }
+            md.Sides = sidesCode;
+            summary["sides"] = sides;
+            if (sidesCode == 1)
+            {
+                if (!prms.ContainsKey("sideAngle")) throw new ArgumentException("sides:sloping needs sideAngle (degrees from vertical)");
+                md.SideAngle = (float)GetDouble(prms, "sideAngle");
+                summary["sideAngle"] = (double)md.SideAngle;
+            }
+            if (sidesCode == 2)
+            {
+                var pid = GetString(prms, "sideProfileGeometryId", "");
+                object prof;
+                if (string.IsNullOrEmpty(pid) || !_objectCache.TryGetValue(pid, out prof)) throw new ArgumentException("sides:profiled needs sideProfileGeometryId (an open profile geometry drawn in the XZ sense: X = distance from the wall, Z = depth)");
+                md.SetSideProfile(prof, GetDouble(prms, "sideProfileRefX", 0.0), GetDouble(prms, "sideProfileRefY", 0.0));
+                summary["sideProfileGeometryId"] = pid;
+            }
+            if (prms.ContainsKey("maxDepthPerCut"))
+            {
+                if (helical) summary["maxDepthPerCutIgnored"] = "helical=true already uses MaxDepthPerCut as the pitch (helicalPitch)";
+                else { md.MaxDepthPerCut = (float)GetDouble(prms, "maxDepthPerCut"); summary["maxDepthPerCut"] = (double)md.MaxDepthPerCut; }
+            }
+            if (prms.ContainsKey("autoZ"))
+            {
+                bool autoZ = GetBool(prms, "autoZ", false);
+                md.AutoZ = autoZ;
+                summary["autoZ"] = autoZ;
+                if (autoZ)
+                {
+                    if (prms.ContainsKey("autoZMaxDepthOfCut")) md.AutoZMaxDepthOfCut = (float)GetDouble(prms, "autoZMaxDepthOfCut");
+                    if (prms.ContainsKey("autoZMinDepthOfCut")) md.AutoZMinDepthOfCut = (float)GetDouble(prms, "autoZMinDepthOfCut");
+                    if (prms.ContainsKey("autoZStockZ")) md.AutoZStockZ = (float)GetDouble(prms, "autoZStockZ");
+                    if (prms.ContainsKey("autoZRampAngle")) md.AutoZRampAngle = (float)GetDouble(prms, "autoZRampAngle");
+                    if (prms.ContainsKey("autoZRapidLevelIsAbsolute")) md.AutoZRapidLevelIsAbsolute = GetBool(prms, "autoZRapidLevelIsAbsolute", true);
+                    try { summary["autoZMaxDepthOfCut"] = (double)md.AutoZMaxDepthOfCut; } catch { }
+                    try { summary["autoZMinDepthOfCut"] = (double)md.AutoZMinDepthOfCut; } catch { }
+                }
+            }
+            return summary;
+        }
+
+        // Single api_invoke call (also used per item by batch mode).
+        private Dictionary<string, object> InvokeApi(Dictionary<string, object> prms)
+        {
+            var target = ResolveApiTarget(GetString(prms, "target", "app"));
+            var member = GetString(prms, "member", "");
+            if (string.IsNullOrEmpty(member)) throw new ArgumentException("member is required");
+            var kind = GetString(prms, "kind", "auto");
+            var argArr = ConvertApiArgs(prms.ContainsKey("args") ? prms["args"] as System.Collections.ArrayList : null);
+
+            System.Reflection.BindingFlags flags;
+            switch (kind)
+            {
+                case "get": flags = System.Reflection.BindingFlags.GetProperty; break;
+                case "set": flags = System.Reflection.BindingFlags.SetProperty; break;
+                case "method": flags = System.Reflection.BindingFlags.InvokeMethod; break;
+                case "auto": flags = System.Reflection.BindingFlags.InvokeMethod | System.Reflection.BindingFlags.GetProperty; break;
+                default: throw new ArgumentException("kind must be auto, method, get or set");
+            }
+            if (kind == "set" && argArr.Length == 0)
+                throw new ArgumentException("kind:\"set\" needs args (the new value; for indexed properties the index args first, value last)");
+
+            System.Reflection.ParameterModifier[] mods = null;
+            var byRefList = prms.ContainsKey("byRef") ? prms["byRef"] as System.Collections.ArrayList : null;
+            if (byRefList != null && byRefList.Count > 0)
+            {
+                if (argArr.Length == 0) throw new ArgumentException("byRef given but args is empty");
+                var pm = new System.Reflection.ParameterModifier(argArr.Length);
+                foreach (var o in byRefList)
+                {
+                    var idx = Convert.ToInt32(o);
+                    if (idx < 0 || idx >= argArr.Length) throw new ArgumentException("byRef index " + idx + " out of range");
+                    pm[idx] = true;
+                }
+                mods = new[] { pm };
+            }
+
+            // Coerce numeric args to the parameter types the interop
+            // method actually declares. Late-bound IDispatch matches a
+            // ByRef double slot to a VT_R8|BYREF variant, so a JSON
+            // integer (VT_I4) throws DISP_E_TYPEMISMATCH — most visible
+            // on ByRef output params seeded with 0. Reflecting the real
+            // signature lets a plain "0" stand in for "0.0" everywhere.
+            CoerceArgsToSignature(target, member, argArr);
+
+            object ret;
+            // Objects owned by an Alphacam add-in (SolidPart from the
+            // STL/Parasolid importer, for example) surface as a bare
+            // "_ComObject": their type library isn't registered, so
+            // IDispatch name lookup fails with TYPE_E_CANTLOADLIBRARY.
+            // The interop assembly still declares their interfaces
+            // (ISolidPart etc.), so QI to one of those and invoke via
+            // the vtable instead. Found 2026-09-29.
+            Type viaIface = null;
+            if (GetComTypeName(target) == "_ComObject") viaIface = ProbeInteropInterface(target);
+            try
+            {
+                if (viaIface != null)
+                {
+                    CoerceArgsToInterfaceSignature(viaIface, member, argArr);
+                    ret = InvokeViaInterface(viaIface, target, member, flags, argArr);
+                }
+                else
+                {
+                    try
+                    {
+                        ret = target.GetType().InvokeMember(member, flags, null, target, argArr, mods, null, null);
+                    }
+                    catch (Exception ex0)
+                    {
+                        var inner0 = (ex0 is System.Reflection.TargetInvocationException && ex0.InnerException != null) ? ex0.InnerException : ex0;
+                        var com0 = inner0 as COMException;
+                        if (com0 == null || (uint)com0.HResult != 0x80029C4A) throw;
+                        viaIface = ProbeInteropInterface(target);
+                        if (viaIface == null) throw;
+                        CoerceArgsToInterfaceSignature(viaIface, member, argArr);
+                        ret = InvokeViaInterface(viaIface, target, member, flags, argArr);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                var inner = (ex is System.Reflection.TargetInvocationException && ex.InnerException != null) ? ex.InnerException : ex;
+                var com = inner as COMException;
+                if (viaIface != null && inner is MissingMethodException)
+                    throw new ArgumentException("'" + member + "' is not a member of " + viaIface.Name + " (vtable path). Check spelling with alphacam_api_inspect.");
+                if (com != null && (uint)com.HResult == 0x80020006)
+                    throw new ArgumentException("'" + member + "' is not a member of " + GetComTypeName(target) + ". Check spelling with alphacam_api_help.");
+                if (com != null && (uint)com.HResult == 0x8002000E)
+                    throw new ArgumentException("'" + member + "' was called with the wrong number of arguments (" + argArr.Length + "). Check the signature with alphacam_api_help.");
+                if (com != null && ((uint)com.HResult == 0x80020005 || (uint)com.HResult == 0x80020008))
+                    throw new ArgumentException("'" + member + "' argument type mismatch: " + inner.Message + ". Check the signature with alphacam_api_help.");
+                throw new InvalidOperationException(GetComTypeName(target) + "." + member + " failed: " + inner.Message);
+            }
+
+            var res = new Dictionary<string, object> { ["result"] = ConvertApiResult(ret) };
+            if (mods != null)
+            {
+                var outVals = new Dictionary<string, object>();
+                foreach (var o in byRefList)
+                {
+                    var idx = Convert.ToInt32(o);
+                    outVals[idx.ToString()] = ConvertApiResult(argArr[idx]);
+                }
+                res["byRefValues"] = outVals;
+            }
+            return res;
+                }
+
+        private static string RefIndex(object v)
+        {
+            var d = v as Dictionary<string, object>;
+            if (d != null && d.ContainsKey("$ref")) return Convert.ToString(d["$ref"]);
+            var str = v as string;
+            if (str != null && str.StartsWith("$ref:")) return str.Substring(5);
+            return null;
+        }
+
+        private object ResolveBatchRef(object v, List<string> handles, int current)
+        {
+            var idx = RefIndex(v);
+            if (idx == null) return v;
+            int i;
+            if (!int.TryParse(idx, out i) || i < 0 || i >= current) throw new ArgumentException("calls[" + current + "]: $ref " + idx + " must point at an earlier call");
+            if (handles[i] == null) throw new ArgumentException("calls[" + current + "]: call " + i + " returned no object handle to reference");
+            return handles[i];
+        }
+
+        private object ResolveBatchRefArg(object a, List<string> handles, int current)
+        {
+            var idx = RefIndex(a);
+            if (idx == null) return a;
+            var id = (string)ResolveBatchRef(a, handles, current);
+            return new Dictionary<string, object> { ["$id"] = id };
+        }
+
+        // Models registered as stock via machine_3d.stockModelId — excluded
+        // from simulate's default comparison set.
+        private readonly List<object> _stockModels = new List<object>();
+
+        // Same underlying solid/surface? Item(i) hands out fresh wrappers, so
+        // use the objects' own IsSame before falling back to IUnknown identity.
+        private static bool SameModel(object a, object b)
+        {
+            if (a == null || b == null) return false;
+            try { var sa = AsSolidPart(a); var sb = AsSolidPart(b); if (sa != null && sb != null) return sa.IsSame((SolidPart)b); } catch { }
+            try { var ua = AsSurface(a); var ub = AsSurface(b); if (ua != null && ub != null) return ua.IsSame((Surface)b); } catch { }
+            IntPtr pa = IntPtr.Zero, pb = IntPtr.Zero;
+            try { pa = Marshal.GetIUnknownForObject(a); pb = Marshal.GetIUnknownForObject(b); return pa == pb; }
+            catch { return false; }
+            finally { if (pa != IntPtr.Zero) Marshal.Release(pa); if (pb != IntPtr.Zero) Marshal.Release(pb); }
+        }
+
+        // SaveStlFile exports every visible solid (type 1) or surface (type 2).
+        // Hide everything not in `only` for the duration, then restore.
+        private void ExportModelsStl(dynamic drw, string path, int type, double tol, List<KeyValuePair<string, object>> only)
+        {
+            var hidden = new List<object>();
+            try
+            {
+                if (only != null)
+                {
+                    var all = new List<KeyValuePair<string, object>>();
+                    all.AddRange(EnumerateSolidParts(drw, false)); all.AddRange(EnumerateSurfaces(drw, false));
+                    foreach (var kv in all)
+                    {
+                        if (only.Exists(o => SameModel(o.Value, kv.Value))) continue;
+                        bool vis = true;
+                        try { var sp = AsSolidPart(kv.Value); if (sp != null) { vis = sp.Visible; if (vis) { sp.Visible = false; hidden.Add(kv.Value); } continue; } } catch { }
+                        try { var su = AsSurface(kv.Value); if (su != null) { vis = su.Visible; if (vis) { su.Visible = false; hidden.Add(kv.Value); } } } catch { }
+                    }
+                }
+                drw.SaveStlFile(path, (short)type, tol);
+            }
+            finally
+            {
+                foreach (var o in hidden)
+                {
+                    try { var sp = AsSolidPart(o); if (sp != null) { sp.Visible = true; continue; } } catch { }
+                    try { var su = AsSurface(o); if (su != null) su.Visible = true; } catch { }
+                }
+            }
+        }
+
+        // Lowest Z of the model's top surface (top-down height map of a quick
+        // STL export). NaN when it can't be computed. Solids export as STL
+        // type 1, surfaces as type 2.
+        private double ModelTopSurfaceMinZ(dynamic drw, bool solids, List<KeyValuePair<string, object>> onlyThese)
+        {
+            string tmp = null;
+            try
+            {
+                tmp = Path.Combine(Path.GetTempPath(), "AlphacamBridge-topmin-" + Guid.NewGuid().ToString("N") + ".stl");
+                ExportModelsStl(drw, tmp, solids ? 1 : 2, 0.01, onlyThese);
+                var tris = StlCompare.ReadStl(tmp);
+                if (tris.Count == 0) return double.NaN;
+                double x0, y0, z0, x1, y1, z1; StlCompare.Bounds(tris, out x0, out y0, out z0, out x1, out y1, out z1);
+                var hm = StlCompare.HeightMap(tris, x0, y0, x1, y1, 80);
+                double min = double.PositiveInfinity;
+                for (int i = 0; i < 80; i++) for (int j = 0; j < 80; j++) if (!double.IsNaN(hm[i, j]) && hm[i, j] < min) min = hm[i, j];
+                return double.IsInfinity(min) ? double.NaN : min;
+            }
+            catch (Exception ex) { Log("ModelTopSurfaceMinZ: " + ex.Message); return double.NaN; }
+            finally { try { if (tmp != null && File.Exists(tmp)) File.Delete(tmp); } catch { } }
         }
 
         // ── Generic API helpers ─────────────────────────────────────
@@ -2415,6 +3660,99 @@ namespace CambotAlphacam
             catch { return null; }
         }
 
+        // Interop interfaces we QI for when a COM object has no loadable type
+        // library (add-in objects). Ordered most-specific first; the first
+        // successful QI wins. Dual interfaces only — IUnknown-only ones
+        // (ISolidPartEx) can't be driven by InvokeMember's IDispatch fallback,
+        // so they're excluded here and cast explicitly where needed.
+        private static readonly string[] ProbeInterfaceNames =
+        {
+            "ISolidPart", "ISurface", "IPath", "ISpline", "IText", "IClamp", "IWorkpiece",
+            "ILayer", "IWorkPlane", "IOperation", "ISubOperation", "IMillTool", "IMillData",
+            "IPaths", "ISurfaces", "ISolidParts", "IAlphacamObjects", "IElement", "IPolyline",
+        };
+        private readonly Dictionary<IntPtr, Type> _probedIfaceByUnknown = new Dictionary<IntPtr, Type>();
+
+        // Find an interop interface the object actually implements, by
+        // QueryInterface. Returns null when nothing matches.
+        private Type ProbeInteropInterface(object comObj)
+        {
+            if (comObj == null || !Marshal.IsComObject(comObj)) return null;
+            IntPtr unk = IntPtr.Zero;
+            try
+            {
+                unk = Marshal.GetIUnknownForObject(comObj);
+                Type cached;
+                if (_probedIfaceByUnknown.TryGetValue(unk, out cached)) return cached;
+                var asm = typeof(IAlphaCamApp).Assembly;
+                foreach (var name in ProbeInterfaceNames)
+                {
+                    var t = asm.GetType("AlphaCAMMill." + name, false);
+                    if (t == null || !t.IsInterface) continue;
+                    try
+                    {
+                        if (t.IsInstanceOfType(comObj)) { _probedIfaceByUnknown[unk] = t; return t; }
+                    }
+                    catch { }
+                }
+                return null;
+            }
+            catch { return null; }
+            finally { if (unk != IntPtr.Zero) Marshal.Release(unk); }
+        }
+
+        // Invoke a member through an interop interface's own MethodInfo /
+        // PropertyInfo. Type.InvokeMember on a ComImport interface still
+        // routes through IDispatch (RuntimeType.IsCOMObject is true for it),
+        // which is exactly what fails for add-in objects — so bind the
+        // reflection member by hand and call the interface stub (vtable).
+        private object InvokeViaInterface(Type iface, object target, string member, System.Reflection.BindingFlags flags, object[] argArr)
+        {
+            bool wantSet = (flags & System.Reflection.BindingFlags.SetProperty) != 0;
+            bool wantGet = (flags & System.Reflection.BindingFlags.GetProperty) != 0;
+            bool wantMethod = (flags & System.Reflection.BindingFlags.InvokeMethod) != 0;
+            var prop = iface.GetProperty(member);
+            if (prop != null && (wantSet || wantGet))
+            {
+                if (wantSet)
+                {
+                    if (argArr.Length == 0) throw new ArgumentException("set needs a value");
+                    var idx = new object[argArr.Length - 1];
+                    Array.Copy(argArr, idx, idx.Length);
+                    prop.SetValue(target, argArr[argArr.Length - 1], idx.Length > 0 ? idx : null);
+                    return null;
+                }
+                return prop.GetValue(target, argArr.Length > 0 ? argArr : null);
+            }
+            if (wantMethod)
+            {
+                System.Reflection.MethodInfo best = null;
+                foreach (var m in iface.GetMethods())
+                {
+                    if (m.Name != member) continue;
+                    if (m.GetParameters().Length == argArr.Length) { best = m; break; }
+                    if (best == null) best = m;
+                }
+                if (best == null)
+                {
+                    // Property getters are also reachable as get_X on the interface.
+                    var getter = iface.GetMethod("get_" + member);
+                    if (getter != null) best = getter;
+                }
+                if (best != null)
+                {
+                    try { return best.Invoke(target, argArr); }
+                    catch (System.Reflection.TargetInvocationException tie) { throw tie.InnerException ?? tie; }
+                }
+            }
+            throw new MissingMethodException(iface.Name, member);
+        }
+
+        // Cast helpers for add-in objects (see ProbeInteropInterface). `as`
+        // on an RCW performs QueryInterface, no type library needed.
+        private static ISolidPart AsSolidPart(object o) { try { return o as ISolidPart; } catch { return null; } }
+        private static ISurface AsSurface(object o) { try { return o as ISurface; } catch { return null; } }
+
         // Coerce each numeric arg to the element type the interop method's
         // matching parameter declares (ByRef stripped). Best-effort: unknown
         // members or unconvertible values are left as-is for InvokeMember.
@@ -2424,6 +3762,16 @@ namespace CambotAlphacam
             try
             {
                 var iface = ResolveInteropInterface(target);
+                CoerceArgsToInterfaceSignature(iface, member, argArr);
+            }
+            catch { }
+        }
+
+        private void CoerceArgsToInterfaceSignature(Type iface, string member, object[] argArr)
+        {
+            if (argArr == null || argArr.Length == 0) return;
+            try
+            {
                 if (iface == null) return;
                 System.Reflection.ParameterInfo[] pars = null;
                 foreach (var m in iface.GetMethods())
@@ -2433,7 +3781,23 @@ namespace CambotAlphacam
                     if (candidate.Length == argArr.Length) { pars = candidate; break; }
                     if (pars == null) pars = candidate; // fallback: first by name
                 }
-                if (pars == null) return;
+                if (pars == null)
+                {
+                    // Property write: coerce the value (last arg) to the
+                    // declared property type. Matters on the vtable path,
+                    // where a JSON true/1 must arrive as the exact CLR type.
+                    var prop = iface.GetProperty(member);
+                    if (prop != null && argArr.Length >= 1)
+                    {
+                        var last = argArr[argArr.Length - 1];
+                        var ptp = prop.PropertyType;
+                        if (last != null && !Marshal.IsComObject(last) && (last is IConvertible) && (ptp.IsPrimitive || ptp == typeof(decimal) || ptp == typeof(string) || ptp.IsEnum))
+                        {
+                            try { argArr[argArr.Length - 1] = ptp.IsEnum ? Enum.ToObject(ptp, Convert.ToInt32(last)) : Convert.ChangeType(last, ptp); } catch { }
+                        }
+                    }
+                    return;
+                }
                 for (int i = 0; i < argArr.Length && i < pars.Length; i++)
                 {
                     var a = argArr[i];
@@ -2446,6 +3810,10 @@ namespace CambotAlphacam
                     if ((a is IConvertible) && (pt.IsPrimitive || pt == typeof(decimal) || pt == typeof(string)))
                     {
                         try { argArr[i] = Convert.ChangeType(a, pt); } catch { }
+                    }
+                    else if ((a is IConvertible) && pt.IsEnum)
+                    {
+                        try { argArr[i] = Enum.ToObject(pt, Convert.ToInt32(a)); } catch { }
                     }
                 }
             }

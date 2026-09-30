@@ -11,17 +11,26 @@ plain-English conversation:
 > "Draw a 24x12 panel, drill ten 8 mm holes along the bottom, profile the outside
 > with a ramped lead-in in two passes, and post the G-code."
 
-It exposes **62 tools** covering:
+It exposes **67 tools** covering:
 
 - **Drawing & CAD editing** — rectangles, circles, polygons, text, arbitrary 2D paths;
   move/rotate/mirror/scale (with array patterns), offset, fillet/chamfer, join, explode
-- **Machining** — profile (rough/finish with helical descent and automatic lead-in/out),
-  pocketing, drilling/tapping (batch), engraving, manual toolpaths
+- **Machining** — profile (rough/finish with helical descent, automatic lead-in/out,
+  sloping/profiled sides and auto-Z levels), pocketing, drilling/tapping (batch),
+  engraving, manual toolpaths
+- **3D machining** — import an STL/STEP/Parasolid model as a solid, then Z-contour
+  roughing, parallel/raster, waterline (Z-contour) finishing, steep/shallow, projected
+  contours, radial, spiral, rest machining and drive-curve strategies with boundaries,
+  stock models and lead/link control — with plan checks on every operation and a
+  **simulate-and-compare** step that measures material left / gouges against the
+  model before anything is posted
+- **Long jobs** — dense 3D machining, simulation, posting, imports and nests can run
+  in the background and be polled, so no client timeout is hit
 - **Setup** — tools, posts, panels/materials, layers, work planes, tool sides, start points
 - **Nesting** — parts from your drawing saved to part files, generated nest lists
   (quantities, rotation rules, gaps, sheet-edge gap), sheets taken from drawing geometry,
   multi-sheet nests, nested toolpath ordering, per-sheet NC output
-- **Interop** — DXF/STEP/IGES/STL import, DXF/EMF/STL/IGES export, drawing queries
+- **Interop** — DXF/STEP/IGES/STL/Parasolid/SolidWorks import, DXF/EMF/STL/IGES export, drawing queries
 - **Human-in-the-loop** — act on your current ALPHACAM selection, or have ALPHACAM
   prompt you to pick geometry mid-conversation
 - **The entire automation API** — beyond the curated tools above, a generic invoke
@@ -60,6 +69,10 @@ tools cover the rest of the automation API — 57 COM objects, ~650 methods,
   (including ByRef output parameters)
 - `alphacam_api_inspect` — see what an object handle is and what members it has
 - `alphacam_api_release` — free handles after long sessions
+
+`alphacam_api_invoke` also takes a `calls` array to run a sequence of API calls in
+one round-trip (one permission prompt in Claude Desktop), with `{"$ref": i}` to feed
+one call's returned object into a later one.
 
 Paired with `alphacam_api_help` (searchable documentation generated from your own
 `ACAMAPI.chm`), the agent can discover a member, read its signature, and call it —

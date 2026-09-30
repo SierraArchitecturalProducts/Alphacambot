@@ -67,10 +67,11 @@ export const TOOL_DEFINITIONS = [
   {
     name: 'alphacam_import_cad',
     description:
-      'Import a CAD file into the current drawing. Supported formats: DXF/DWG (OpenDxfFile), STEP (OpenStepFile — imports as surfaces), IGES (OpenIgesFile), STL (OpenStlFile). The format determines which Alphacam import method is called.',
+      'Import a CAD file into the drawing. 2D: DXF/DWG (OpenDxfFile), IGES (OpenIgesFile). 3D: STL, STEP/STP, Parasolid (.x_t/.x_b), SolidWorks (.sldprt), SAT and anything else an ALPHACAM import add-in handles go through App.OpenExternalFile and arrive as a SOLID PART that alphacam_machine_3d can machine (asSolid, the default for 3D formats). STEP with asSolid:false uses OpenStepFile (surfaces). STL with asSolid:false uses the legacy OpenStlFile, which explodes the model into one facet geometry per triangle — visible but NOT machinable as a model. clear:true (default) starts a fresh drawing first (File>New semantics) and DROPS the current tool/post selection — call alphacam_select_tool again before machining; clear:false merges into the open drawing. Returns solid/surface/geometry counts and the ids of newly added solids/surfaces.',
     inputSchema: {
       type: 'object',
       properties: {
+        background: { type: 'boolean', description: 'Run in the background and return a jobId immediately; poll alphacam_job_status until state is done/error. Use for big models (dense finishes, long posts) so no client timeout is hit.' },
         path: {
           type: 'string',
           description: 'Full path to the CAD file',
@@ -78,8 +79,20 @@ export const TOOL_DEFINITIONS = [
         format: {
           type: 'string',
           description:
-            'File format. If omitted, inferred from extension.',
-          enum: ['dxf', 'iges', 'step', 'stl'],
+            'File format. If omitted, inferred from the extension (dwg→dxf, igs→iges, stp→step; any other extension is handed to OpenExternalFile).',
+          enum: ['dxf', 'iges', 'step', 'stl', 'x_t', 'x_b', 'sldprt', 'sat'],
+        },
+        asSolid: {
+          type: 'boolean',
+          description: 'STL/STEP: import as a solid part via OpenExternalFile (default true for 3D formats). false = legacy behaviour (STL→facet geometries, STEP→surfaces).',
+        },
+        clear: {
+          type: 'boolean',
+          description: 'Clear the drawing before importing (default true). false merges into the current drawing and keeps the tool selection.',
+        },
+        externalType: {
+          type: 'string',
+          description: 'Optional importer type name for OpenExternalFile when the extension alone cannot pick it (e.g. "Parasolid"). Normally omit.',
         },
       },
       required: ['path'],
@@ -527,6 +540,18 @@ export const TOOL_DEFINITIONS = [
         leadOverlap: { type: 'number', description: 'Overlap distance between lead-in start and lead-out end (LeadData.Overlap).' },
         leadInFeedModifier: { type: 'number', description: 'Feedrate multiplier during lead-in (LeadData.FeedrateModifierIn). 1.0 = full cut feed.' },
         leadOutFeedModifier: { type: 'number', description: 'Feedrate multiplier during lead-out (LeadData.FeedrateModifierOut).' },
+        sides: { type: 'string', enum: ['vertical', 'sloping', 'profiled'], description: 'Wall style (MillData.Sides). vertical (default) | sloping = tapered wall at sideAngle from vertical (Z is cut in steps of maxDepthPerCut) | profiled = wall follows the open profile geometry in sideProfileGeometryId.' },
+        sideAngle: { type: 'number', description: 'Sloping sides: wall angle in DEGREES from vertical (MillData.SideAngle). Setting this alone implies sides:sloping.' },
+        maxDepthPerCut: { type: 'number', description: 'Sloping/profiled sides: max Z step between the passes that build the wall (MillData.MaxDepthPerCut). Ignored when helical:true (that already uses it as the pitch).' },
+        sideProfileGeometryId: { type: 'string', description: 'Profiled sides: id of an OPEN profile geometry describing the wall section (MillData.SetSideProfile). Implies sides:profiled. CAUTION: the coordinate convention is unresolved — an ovolo drawn from (0,0) to (0.5,-0.5) produced passes at Z +0.5..0 (above the material). Verify the result with the NC or a simulation before using; sides:sloping is the verified option.' },
+        sideProfileRefX: { type: 'number', description: 'Profiled sides: X of the profile reference point (SetSideProfile RefPtX). Default 0.' },
+        sideProfileRefY: { type: 'number', description: 'Profiled sides: Y of the profile reference point (SetSideProfile RefPtY). Default 0.' },
+        autoZ: { type: 'boolean', description: 'Automatic multi-level Z cuts (MillData.AutoZ). NOT FUNCTIONAL through the API on ALPHACAM 2025: the AutoZ* setters are ignored (AutoZ reads back false) and no toolpaths result — verified 2026-09-29. Use numberOfCuts, or sides:sloping with maxDepthPerCut, instead.' },
+        autoZMaxDepthOfCut: { type: 'number', description: 'Auto-Z: maximum depth per cut.' },
+        autoZMinDepthOfCut: { type: 'number', description: 'Auto-Z: minimum depth per cut.' },
+        autoZStockZ: { type: 'number', description: 'Auto-Z: Z stock to leave.' },
+        autoZRampAngle: { type: 'number', description: 'Auto-Z: ramp angle between levels (degrees).' },
+        autoZRapidLevelIsAbsolute: { type: 'boolean', description: 'Auto-Z: rapid level is absolute (true) or relative to each level (false).' },
       },
       required: [],
     },
@@ -610,6 +635,18 @@ export const TOOL_DEFINITIONS = [
         leadOverlap: { type: 'number', description: 'Overlap distance between lead-in and lead-out (LeadData.Overlap).' },
         leadInFeedModifier: { type: 'number', description: 'Feedrate multiplier during lead-in (LeadData.FeedrateModifierIn).' },
         leadOutFeedModifier: { type: 'number', description: 'Feedrate multiplier during lead-out (LeadData.FeedrateModifierOut).' },
+        sides: { type: 'string', enum: ['vertical', 'sloping', 'profiled'], description: 'Wall style (MillData.Sides). vertical (default) | sloping = tapered wall at sideAngle from vertical (Z is cut in steps of maxDepthPerCut) | profiled = wall follows the open profile geometry in sideProfileGeometryId.' },
+        sideAngle: { type: 'number', description: 'Sloping sides: wall angle in DEGREES from vertical (MillData.SideAngle). Setting this alone implies sides:sloping.' },
+        maxDepthPerCut: { type: 'number', description: 'Sloping/profiled sides: max Z step between the passes that build the wall (MillData.MaxDepthPerCut). Ignored when helical:true (that already uses it as the pitch).' },
+        sideProfileGeometryId: { type: 'string', description: 'Profiled sides: id of an OPEN profile geometry describing the wall section (MillData.SetSideProfile). Implies sides:profiled. CAUTION: the coordinate convention is unresolved — an ovolo drawn from (0,0) to (0.5,-0.5) produced passes at Z +0.5..0 (above the material). Verify the result with the NC or a simulation before using; sides:sloping is the verified option.' },
+        sideProfileRefX: { type: 'number', description: 'Profiled sides: X of the profile reference point (SetSideProfile RefPtX). Default 0.' },
+        sideProfileRefY: { type: 'number', description: 'Profiled sides: Y of the profile reference point (SetSideProfile RefPtY). Default 0.' },
+        autoZ: { type: 'boolean', description: 'Automatic multi-level Z cuts (MillData.AutoZ). NOT FUNCTIONAL through the API on ALPHACAM 2025: the AutoZ* setters are ignored (AutoZ reads back false) and no toolpaths result — verified 2026-09-29. Use numberOfCuts, or sides:sloping with maxDepthPerCut, instead.' },
+        autoZMaxDepthOfCut: { type: 'number', description: 'Auto-Z: maximum depth per cut.' },
+        autoZMinDepthOfCut: { type: 'number', description: 'Auto-Z: minimum depth per cut.' },
+        autoZStockZ: { type: 'number', description: 'Auto-Z: Z stock to leave.' },
+        autoZRampAngle: { type: 'number', description: 'Auto-Z: ramp angle between levels (degrees).' },
+        autoZRapidLevelIsAbsolute: { type: 'boolean', description: 'Auto-Z: rapid level is absolute (true) or relative to each level (false).' },
       },
       required: [],
     },
@@ -862,10 +899,11 @@ export const TOOL_DEFINITIONS = [
   {
     name: 'alphacam_output_nc',
     description:
-      'Generate NC code (G-code) for the current drawing using the active post processor (Drawing.OutputNC). Defaults to UNATTENDED mode for the Xilog+ post: the shim patches LicomdirPath\\VBMacros\\Startup\\XilogPlusPost\\XilogPost.ini to set DisplayScreen=0 (skips the operator dialog) plus pre-populates sDX/sDY/sDZ (from the last specify_panel), sBX=0, sBY=0, sBZ=20, sV=10, sField=AD; then runs OutputNC; then restores DisplayScreen=1 so interactive use is unaffected. Set unattended=false to preserve the classic operator-dialog flow. Returns OutputNCStatus (0=success). Select a post processor first with alphacam_select_post if needed.',
+      'Generate NC code (G-code) for the current drawing using the active post processor (Drawing.OutputNC). Defaults to UNATTENDED mode for the Xilog+ post: the shim patches LicomdirPath\\VBMacros\\Startup\\XilogPlusPost\\XilogPost.ini to set DisplayScreen=0 (skips the operator dialog) plus pre-populates sDX/sDY/sDZ (from the last specify_panel), sBX=0, sBY=0, sBZ=20, sV=10, sField=AD; then runs OutputNC; then restores DisplayScreen=1 so interactive use is unaffected. Set unattended=false to preserve the classic operator-dialog flow. Returns OutputNCStatus (0=success). Select a post processor first with alphacam_select_post if needed. DEFINE THE MATERIAL FIRST (alphacam_specify_panel for Router, or alphacam_specify_material): the Xilog post takes its DX/DY/DZ from it, ALPHACAM simulation needs it, and 3D roughing uses it as the stock — output without a material/panel is usually wrong.',
     inputSchema: {
       type: 'object',
       properties: {
+        background: { type: 'boolean', description: 'Run in the background and return a jobId immediately; poll alphacam_job_status until state is done/error. Use for big models (dense finishes, long posts) so no client timeout is hit.' },
         path: {
           type: 'string',
           description: 'Output NC file path. Defaults to the drawing path with .nc extension, or %TEMP%\\output.nc if unsaved.',
@@ -1235,6 +1273,157 @@ export const TOOL_DEFINITIONS = [
   },
 
   // ════════════════════════════════════════════════════════════════
+  //  3D MODELS & SURFACE/SOLID MACHINING (added 2026-09-29)
+  //  Workflow: import_cad (STL/STEP → solid part) → select_tool (ball/bull
+  //  nose) → list_3d_models → machine_3d strategy:rough → machine_3d
+  //  strategy:parallel (or zContours/...) → output_nc.
+  // ════════════════════════════════════════════════════════════════
+  {
+    name: 'alphacam_list_3d_models',
+    description:
+      'List the 3D models in the drawing: SOLID PARTS (Drawing.SolidParts — STL/Parasolid/STEP imported via alphacam_import_cad, or SolidWorks etc.) and SURFACES (Drawing.Surfaces — from STEP-as-surfaces, IGES, or CreateSurface* API calls). Each entry has a modelId (use it in alphacam_machine_3d / alphacam_delete_3d_model), kind, name, extents (min/max XYZ), visible and selected flags. Also reports how many legacy STL facet geometries exist (an STL opened with the old OpenStlFile shows up as thousands of tiny geometries with Path.STL=true and CANNOT be machined as a model — re-import with asSolid:true).',
+    inputSchema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'alphacam_delete_3d_model',
+    description:
+      'Delete solid parts and/or surfaces from the drawing by modelId (from alphacam_list_3d_models), all:true, selected:true, or interactive:true (user picks in ALPHACAM). Geometries and toolpaths are untouched.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        modelId: { type: 'string', description: 'One model id.' },
+        modelIds: { type: 'array', items: { type: 'string' }, description: 'Several model ids.' },
+        all: { type: 'boolean', description: 'Delete every solid and surface.' },
+        selected: { type: 'boolean', description: 'Delete the models currently selected in ALPHACAM.' },
+        interactive: { type: 'boolean', description: 'Prompt the user to pick models (blocks until they finish).' },
+        prompt: { type: 'string', description: 'Prompt-bar text for interactive mode.' },
+      },
+    },
+  },
+  {
+    name: 'alphacam_machine_3d',
+    description:
+      "3D surface/solid machining (MillData.MachineSolid / MachineSurfaces / MachineSolidsAndSurfaces) on solid parts and surfaces — the way to cut an imported STL/STEP model. A tool (ball or bull nose for finishing, flat for roughing) must be selected first; importing with clear:true drops it, so re-select after import. Targets: modelId/modelIds from alphacam_list_3d_models, all:true, selected:true, interactive:true — or omit when the drawing holds exactly one model. STRATEGIES (strategy param): 'rough' = Z-contour roughing (SurfaceMCAction=ROUGHING; clears stock level by level with maxDepthPerCut/stepover/stockXY/stockZ, runs on the Machining Engine by default); 'parallel' = raster/lace finishing in the XY plane (acamSurfaceMCXY); 'zContours' = waterline / horizontal Z finishing (use upperZ/lowerZ, millingType); 'zContoursSteep' + 'parallelShallow' = the steep/shallow pair; 'parallelSteep'; 'projectedContours'; 'radial' (startAngle/endAngle/stepAngle about the boundary centre); 'spiral' (innerRadius/outerRadius); 'restMachining' (restType + previousToolDiameter — pencil/corner clean-up after a bigger tool); 'driveCurve' (driveCurveGeometryId); 'flatAreaOffset'; 'zContoursAndFlat'; 'helicalZ'; 'cylindricalParallel'; 'parameterLines' (needs startPoint/directionPoint). Defaults: safeRapidLevel 1.0, rapidDownTo 0.25, chordError 0.001 (in drawing units — raise it for mm drawings, e.g. 0.01), stepover 10% of tool diameter for finishing / 50% for roughing, maxDepthPerCut 50% of tool diameter for roughing. Surface finish is governed by stepover (or cuspHeight, the scallop height) and chordError. Use boundaryGeometryIds (closed geometries) to contain the cut — a boundary SMALLER than the model footprint leaves everything outside it untouched (roughing terraces stay), so only bound a finish deliberately. The response carries plan-check warnings (rapid levels vs model top, roughing floor vs model bottom, edge roll-over, coverage) — read them, then run alphacam_simulate before posting. Define the MATERIAL before machining (alphacam_specify_panel with topZ at the model top, e.g. topZ:1 bottomZ:0 for a model spanning Z 0..1) — roughing takes its stock from it, simulation needs it, and the post reads it. Parallel passes run along the current work plane\'s X axis; to raster at another angle rotate a work plane (alphacam_manage_workplane) — no MillData angle property changes it (RotationAngle/DirectionAngle/StartAngle/ToolAngle/SetSurfaceMCPoints all verified to have no effect). Returns toolpath ids, element count, total length and ALPHACAM's time estimate. Posting these toolpaths is slow (thousands of moves) — alphacam_output_nc has a long timeout for that. Escape hatches: millDataProperties / engineProperties set any MillData / MillDataMachiningEngine property by name.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        background: { type: 'boolean', description: 'Run in the background and return a jobId immediately; poll alphacam_job_status until state is done/error. Use for big models (dense finishes, long posts) so no client timeout is hit.' },
+        strategy: {
+          type: 'string',
+          description: "Machining strategy. Default 'parallel'.",
+          enum: ['rough', 'parallel', 'zContours', 'zContoursSteep', 'parallelShallow', 'parallelSteep', 'projectedContours', 'radial', 'spiral', 'restMachining', 'driveCurve', 'flatAreaOffset', 'zContoursAndFlat', 'helicalZ', 'cylindricalParallel', 'parameterLines'],
+        },
+        modelId: { type: 'string', description: 'Solid/surface id from alphacam_list_3d_models or alphacam_import_cad.' },
+        modelIds: { type: 'array', items: { type: 'string' }, description: 'Several model ids (solids and surfaces may be mixed).' },
+        all: { type: 'boolean', description: 'Machine every solid and surface in the drawing.' },
+        selected: { type: 'boolean', description: 'Machine the models currently selected in the ALPHACAM window.' },
+        interactive: { type: 'boolean', description: 'Have ALPHACAM prompt the user to pick solids/surfaces (blocks until they press Enter).' },
+        prompt: { type: 'string', description: 'Prompt-bar text for interactive mode.' },
+        axisType: { type: 'string', enum: ['3axis', '4axisXZ', '4axisYZ', '4axisXY', '4axisXY90', '5axis', '3axisHelical', '3axisLocal'], description: 'Tool axis type (MillData.SurfaceMCAxisType). Default 3axis.' },
+        fiveAxisAngle: { type: 'number', description: '5-axis: angle between tool and surface normal (SurfaceMC5AxisAngle).' },
+        safeRapidLevel: { type: 'number', description: 'Clearance Z for rapids. Default 1.0. Must be above the model top.' },
+        rapidDownTo: { type: 'number', description: 'Z to rapid down to before feeding. Default 0.25.' },
+        chordError: { type: 'number', description: 'Chordal tolerance for the 3D path (MillData.ChordError). Default 0.001. Must be > 0.' },
+        facetToleranceMultiplier: { type: 'number', description: 'Facet tolerance = chordError × this (MillData.FacetToleranceMultiplier).' },
+        stepover: { type: 'number', description: 'XY step between passes (MillData.WidthOfCut). Default 10% of tool diameter (finishing) / 50% (roughing).' },
+        cuspHeight: { type: 'number', description: 'Scallop height between passes (MillData.CuspHeight) — alternative way to express surface finish; ALPHACAM derives the step from it.' },
+        stock: { type: 'number', description: 'Finishing: material to leave (MillData.Stock). Roughing: default for both stockXY and stockZ.' },
+        cutDirection: { type: 'string', enum: ['bidirectional', 'conventional', 'climb'], description: 'Pass direction for parallel-type strategies (MillData.CutDirection).' },
+        millingType: { type: 'string', enum: ['climb', 'conventional'], description: 'Climb or conventional for Z-contour finishing (MillData.SurfaceMillingType).' },
+        clockwise: { type: 'boolean', description: 'CW toolpaths for projected-contour style strategies (MillData.SurfaceMCCW).' },
+        upperZ: { type: 'number', description: 'zContours: upper Z limit (SurfaceMCUpperZ).' },
+        lowerZ: { type: 'number', description: 'zContours: lower Z limit (SurfaceMCLowerZ).' },
+        cutInnerSurfaces: { type: 'boolean', description: 'zContours: cut inner rather than outer surfaces (SurfaceMCCutInnerSurfaces).' },
+        maxDepthPerCut: { type: 'number', description: 'rough: Z step between roughing levels (MillData.MaxDepthPerCut). Default 50% of tool diameter.' },
+        stockXY: { type: 'number', description: 'rough: XY stock to leave for finishing (MillData.StockXY).' },
+        stockZ: { type: 'number', description: 'rough: Z stock to leave (MillData.StockZ).' },
+        pocketType: { type: 'string', enum: ['contour', 'linear', 'spiral'], description: 'rough: area-clearance pattern at each level (MillData.PocketType). Default contour.' },
+        zOrder: { type: 'string', enum: ['zone', 'depth'], description: 'rough / zContours: order passes by zone (region by region) or by depth (level by level). Default zone.' },
+        useFlatAreas: { type: 'boolean', description: 'rough: detect and finish flat areas at their exact Z (SurfaceMCUseFlatAreas).' },
+        usePreviousMachining: { type: 'boolean', description: 'rough: take earlier operations into account (SurfaceMCRoughingUsePreviousMachining).' },
+        stockModelId: { type: 'string', description: 'rough: a solid/surface model to use as the STOCK shape — e.g. an STL of the casting, or the stock STL alphacam_simulate exported from the previous setup. Passed via MillDataMachiningEngine.SetMaterials (engine) or MillData.SetStlOrSolidAsMaterial (classic). The stock model is then excluded from alphacam_simulate comparisons automatically. Omit to rough from the material/panel.' },
+        restType: { type: 'string', enum: ['parallelToCorners', 'acrossCorners', 'pencil', 'auto'], description: 'restMachining: pass style (SurfaceRestMCType). Default auto.' },
+        previousToolDiameter: { type: 'number', description: 'restMachining: diameter of the tool that machined before (SurfaceRestMCPrevToolDia).' },
+        startAngle: { type: 'number', description: 'radial: start angle (degrees).' },
+        endAngle: { type: 'number', description: 'radial: end angle (degrees).' },
+        stepAngle: { type: 'number', description: 'radial: angle step between passes (degrees).' },
+        innerRadius: { type: 'number', description: 'spiral: inner radius.' },
+        outerRadius: { type: 'number', description: 'spiral: outer radius.' },
+        boundaryGeometryIds: { type: 'array', items: { type: 'string' }, description: 'Closed geometry ids that CONTAIN the machining (MillData.SetSurfaceMCBoundary). Radial/spiral centre on the first boundary.' },
+        boundaryGeometryId: { type: 'string', description: 'Single containment boundary id.' },
+        driveCurveGeometryId: { type: 'string', description: 'driveCurve: the geometry the tool follows (SetSurfaceDriveCurve).' },
+        startPoint: { type: 'object', properties: { x: { type: 'number' }, y: { type: 'number' }, z: { type: 'number' } }, description: 'parameterLines: start point on the surface (SetSurfaceMCPoints).' },
+        directionPoint: { type: 'object', properties: { x: { type: 'number' }, y: { type: 'number' }, z: { type: 'number' } }, description: 'parameterLines: second point that sets the cut direction.' },
+        toolCanUndercut: { type: 'boolean', description: 'Tool can undercut (SurfaceMCToolCanUndercut).' },
+        checkFoulNonMachined: { type: 'boolean', description: 'Avoid fouling surfaces/solids that are not being machined (CheckFoulNonMachinedSurfacesOrSolids).' },
+        checkFoulCurrentSurface: { type: 'boolean', description: 'parameterLines: check fouling of the current surface.' },
+        checkFoulOtherMachined: { type: 'boolean', description: 'parameterLines: check fouling of other machined surfaces.' },
+        leadsAndLinks: { type: 'boolean', description: 'Add lead-in/out and links between passes (SurfaceMCLeadAndLinks).' },
+        leadArcRadius: { type: 'number', description: 'Leads/links arc radius.' },
+        leadExtensionLength: { type: 'number', description: 'Leads/links extension length.' },
+        leadRampAngle: { type: 'number', description: 'Leads/links ramp angle (degrees).' },
+        leadRampLength: { type: 'number', description: 'Leads/links ramp length.' },
+        smoothLinks: { type: 'boolean', description: 'Smooth the links between passes.' },
+        feedRate: { type: 'number', description: 'Cutting feed (MillData.CutFeed). Omit to use the tool\'s.' },
+        spindleSpeed: { type: 'number', description: 'Spindle RPM (MillData.SpindleSpeed). Omit to use the tool\'s.' },
+        downFeed: { type: 'number', description: 'Plunge/down feed (MillData.DownFeed).' },
+        feedDownDistance: { type: 'number', description: 'Distance above the surface at which rapid changes to feed (MillData.FeedDownDistance).' },
+        engine: { type: 'string', enum: ['classic', 'machiningEngine'], description: "Which engine runs the strategy: 'classic' (MillData.MachineSolid/MachineSurfaces; default for finishing) or 'machiningEngine' (MillDataMachiningEngine — the modern 3D roughing engine with approach/link/trochoidal options; default for rough)." },
+        millType: { type: 'string', enum: ['climb', 'conventional', 'optimised'], description: 'machiningEngine: milling type.' },
+        approachType: { type: 'string', enum: ['automatic', 'preDrilledHoles', 'helix', 'ramp'], description: 'machiningEngine: how the tool enters each level.' },
+        rampAngle: { type: 'number', description: 'machiningEngine: ramp approach angle (degrees).' },
+        feedWhenPlunging: { type: 'boolean', description: 'machiningEngine: use feed (not rapid) when plunging.' },
+        widthOfCutCleanUp: { type: 'number', description: 'machiningEngine rough: stepover for the clean-up pass around remaining stock.' },
+        intermediateMaxDepthPerCut: { type: 'number', description: 'machiningEngine rough: Z step for intermediate levels that clean up the terraces.' },
+        intermediateWidthOfCut: { type: 'number', description: 'machiningEngine rough: stepover on intermediate levels.' },
+        highSpeedCornering: { type: 'boolean', description: 'machiningEngine: round the corners for high-speed machining.' },
+        trochoidal: { type: 'boolean', description: 'machiningEngine: trochoidal (waveform) cutting in slots.' },
+        closeOpenPockets: { type: 'boolean', description: 'machiningEngine: treat open pockets as closed.' },
+        avoidRollover: { type: 'boolean', description: 'machiningEngine: avoid rolling over external edges.' },
+        xyStandOff: { type: 'number', description: 'machiningEngine: XY stand-off from the model.' },
+        minimumRadius: { type: 'number', description: 'machiningEngine: minimum internal radius.' },
+        maxPlungeDepth: { type: 'number', description: 'machiningEngine: maximum plunge depth.' },
+        millDataProperties: { type: 'object', additionalProperties: true, description: 'Escape hatch: any additional MillData property by exact API name → value (enums as integers). Applied after the named params. Use alphacam_api_help "MillData" to find names.' },
+        engineProperties: { type: 'object', additionalProperties: true, description: 'Escape hatch: any MillDataMachiningEngine property by exact API name → value.' },
+      },
+    },
+  },
+
+  {
+    name: 'alphacam_simulate',
+    description:
+      "Close the loop on a 3D job: run ALPHACAM's solid simulation of every toolpath (Drawing.SolidSimulation), export the simulated stock as STL (GetUpdatedStockSTL), export the 3D model as STL, and compare them top-down on a height-map grid. Returns a verdict (OK / INCOMPLETE / GOUGE), max and mean material remaining, max gouge, the percentage of the footprint within deviationTolerance, and the worst spots with XY coordinates so you can see WHERE material is left (e.g. roughing terraces outside a finishing boundary) or where the tool cut below the model. Requires a material/panel (alphacam_specify_panel) and at least one solid/surface model. Comparison is 3-axis (top-down) — undercuts and vertical walls are not measured. Typical: 5-60 s; use background:true for dense jobs. Run this BEFORE alphacam_output_nc and fix the plan if the verdict is not OK.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        background: { type: 'boolean', description: 'Return a jobId immediately and poll alphacam_job_status.' },
+        modelId: { type: 'string', description: 'Compare against this model only (default: every solid/surface except ones used as stockModelId in alphacam_machine_3d).' },
+        modelIds: { type: 'array', items: { type: 'string' }, description: 'Compare against these models only.' },
+        outputDir: { type: 'string', description: 'Folder for the exported STLs. Default: the drawing\'s folder, or %TEMP%\\AlphacamBridge if unsaved.' },
+        name: { type: 'string', description: 'Base file name for <name>-stock.N.stl and <name>-model.stl. Default: the drawing name.' },
+        tolerance: { type: 'number', description: 'Facet tolerance for the exported STLs (drawing units). Default 0.002.' },
+        deviationTolerance: { type: 'number', description: 'Allowed +/- deviation for the pass/fail percentages and the worst-spot lists. Default 0.01.' },
+        gridSize: { type: 'integer', description: 'Height-map resolution per axis over the model footprint (50-600). Default 200.' },
+        worstSpots: { type: 'integer', description: 'How many worst remaining/gouge spots to list. Default 6.' },
+        showTools: { type: 'boolean', description: 'Show tools during the simulation. Default false.' },
+        keepSimulationOpen: { type: 'boolean', description: 'Leave the simulation result displayed in ALPHACAM (default false closes it after export).' },
+        compare: { type: 'boolean', description: 'false = simulate and export the stock only, skip the model comparison. Default true.' },
+      },
+    },
+  },
+  {
+    name: 'alphacam_job_status',
+    description:
+      'Poll a background job started with background:true (alphacam_machine_3d, alphacam_simulate, alphacam_output_nc, alphacam_import_cad, alphacam_nest). Returns state running/done/error, elapsed seconds, and the full result once done. Omit jobId to list all jobs. Answered even while ALPHACAM is busy with the job.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        jobId: { type: 'string', description: 'The jobId returned by the background call. Omit to list jobs.' },
+      },
+    },
+  },
+
+  // ════════════════════════════════════════════════════════════════
   //  NESTING (added 2026-07-20)
   //  Workflow: save_part (extract parts from the drawing to .ard files)
   //  → create_nest_list (.anl with quantities/rotation rules)
@@ -1362,10 +1551,17 @@ export const TOOL_DEFINITIONS = [
       'Use alphacam_api_help first to find the right member and signature, and alphacam_api_inspect to see what a handle is. ' +
       'Examples: {target:"drawing", member:"CreateCircle", args:[0,0,0,50]} · {target:"app", member:"ActiveDrawing", kind:"get"} · ' +
       '{target:"obj_3", member:"Name", kind:"set", args:["Part A"]} · ByRef output params: {target:"obj_3", member:"GetStartPoint", args:[0,0,0], byRef:[0,1,2]} returns byRefValues. ' +
+      'BATCH: pass calls:[{target,member,kind,args,byRef}, ...] instead of a single member to run several API calls in ONE round-trip (one permission prompt); later calls may use {"$ref": i} (zero-based index of an earlier call) as target or inside args to reuse that call\'s returned object handle. Stops at the first error unless continueOnError:true. ' +
       'CAUTION: this is a raw API line — no safety rails. Mutating calls act on the live drawing immediately.',
     inputSchema: {
       type: 'object',
       properties: {
+        calls: {
+          type: 'array',
+          description: 'Batch mode: an ordered list of calls, each {target, member, kind, args, byRef} exactly as for a single call. Results come back as results[] in the same order. Use {"$ref": i} to pass the object returned by call i.',
+          items: { type: 'object', additionalProperties: true },
+        },
+        continueOnError: { type: 'boolean', description: 'Batch mode: keep going after a failed call (default false).' },
         target: {
           type: 'string',
           description: '"app", "drawing", or an objectId/geometryId from an earlier call. Default "app".',
@@ -1387,7 +1583,7 @@ export const TOOL_DEFINITIONS = [
           description: 'Zero-based indices of args passed ByRef (VB "output" parameters). Their post-call values return in byRefValues.',
         },
       },
-      required: ['member'],
+      required: [],
     },
   },
   {

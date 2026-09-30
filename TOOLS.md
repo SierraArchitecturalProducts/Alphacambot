@@ -6,7 +6,7 @@ ALPHACAM. You don't call these yourself — you ask the agent in normal language
 outside and post it") and it picks the right tools. This page is so you can see
 the whole toolbox, understand what each tool does, and know what's possible.
 
-The bridge exposes **66 tools**: 62 for CAD/CAM work, plus four utilities
+The bridge exposes **71 tools**: 67 for CAD/CAM work, plus four utilities
 (connection status, API help, and the two preference tools). They're grouped
 below the way you'd actually use them, roughly in the order of a job.
 
@@ -44,7 +44,7 @@ below the way you'd actually use them, roughly in the order of a job.
 | `alphacam_open_drawing` | Open an existing ALPHACAM drawing (.ard / .amd / .ald / …). |
 | `alphacam_save_drawing` | Save to the current file. |
 | `alphacam_save_as` | Save to a new file (the extension picks Router/Mill/Lathe/etc.). |
-| `alphacam_import_cad` | Bring in a DXF/DWG, STEP, IGES, or STL file. |
+| `alphacam_import_cad` | Bring in a DXF/DWG, IGES, STEP, STL, Parasolid or SolidWorks file. 3D formats arrive as a solid model ready for `alphacam_machine_3d`. (Importing clears the drawing and the tool selection unless told to merge.) |
 | `alphacam_export_file` | Write out a DXF, EMF/WMF picture, STL, or IGES. |
 | `alphacam_insert_drawing` | Drop another drawing/part into this one at a chosen position. |
 | `alphacam_get_drawing_info` | Filename, counts of geometries/toolpaths/layers, unsaved-changes flag. |
@@ -111,14 +111,34 @@ below the way you'd actually use them, roughly in the order of a job.
 
 | Tool | What it does |
 |------|--------------|
-| `alphacam_rough_finish` | Profile a shape (rough/finish) with lead-in/out and optional helical descent — the main contour-cutting operation. |
-| `alphacam_pocket` | Clear out the inside of a closed shape (contour, zigzag, or spiral). |
+| `alphacam_rough_finish` | Profile a shape (rough/finish) with lead-in/out, optional helical descent, sloping (tapered) or profiled walls, and auto-Z depth stepping — the main contour-cutting operation. |
+| `alphacam_pocket` | Clear out the inside of a closed shape (contour, zigzag, or spiral), optionally with sloping/profiled walls and auto-Z levels. |
 | `alphacam_drill_tap` | Drill, peck-drill, tap, bore, or chamfer at circle centres. |
 | `alphacam_engrave` | Follow a shape's centreline at a set depth — engraving / V-carving lines. |
 | `alphacam_manual_toolpath` | Build a toolpath from explicit XYZ moves when you want full control. |
 | `alphacam_set_tool_side` | Cut on the inside, outside, or centre of a shape. |
 | `alphacam_set_tool_side_auto` | Let ALPHACAM decide tool sides for a batch (nesting logic). |
 | `alphacam_delete_toolpath` | Remove a toolpath. |
+
+## 3D machining (STL / STEP / surfaces)
+
+| Tool | What it does |
+|------|--------------|
+| `alphacam_list_3d_models` | List the solid models and surfaces in the drawing (name, size, selected/visible) and hand back the ids the other 3D tools take. |
+| `alphacam_machine_3d` | Cut a 3D model: **rough** (Z-contour roughing, level by level, with stock to leave), then finish with **parallel** (raster), **zContours** (waterline), steep/shallow pairs, projected contours, radial, spiral, rest machining (corner clean-up after a bigger tool), drive curve, and more. Boundaries contain the cut; a stock model can define the starting material. Works on models you select, all models, or ones you pick in ALPHACAM. |
+| `alphacam_delete_3d_model` | Remove a solid model or surface from the drawing. |
+| `alphacam_simulate` | Run ALPHACAM's solid simulation of every toolpath, export the simulated stock, and compare it against the model: a verdict (OK / INCOMPLETE / GOUGE), how much material is left and where, and whether anything was cut below the model. Run it before posting. |
+| `alphacam_job_status` | Poll a long job started with `background: true` (3D machining, simulation, posting, imports, nesting) — the agent gets a job id back immediately and checks on it instead of waiting on one blocking call. |
+
+> **Typical 3D job:** import the STL → specify the panel (top of material at the
+> model's top) → select a flat tool → `machine_3d` rough → select a ball nose →
+> `machine_3d` parallel or zContours → `simulate` → post. Every `machine_3d` call
+> returns plan-check warnings (rapid levels vs. the model and stock top, roughing
+> floor vs. the model's low points, a finishing boundary smaller than the model,
+> uncovered areas, edge roll-over) — read them before going on. Define the
+> material before machining: roughing takes its stock from it, simulation needs it,
+> and the post reads it. Parallel passes run along the work plane's X axis — rotate
+> a work plane to raster at an angle.
 
 ## Operations (the job list)
 
@@ -141,7 +161,7 @@ below the way you'd actually use them, roughly in the order of a job.
 | Tool | What it does |
 |------|--------------|
 | `alphacam_select_post` | Choose the post processor (your machine's G-code dialect). |
-| `alphacam_output_nc` | Post the program to an NC file. |
+| `alphacam_output_nc` | Post the program to an NC file. Set the material/panel first — the Xilog post reads its dimensions from it, and simulation needs it. |
 | `alphacam_list_nc` | Show the generated NC code. |
 
 > **Post processors differ.** Alphacambot doesn't assume any particular
@@ -165,7 +185,7 @@ for a dedicated tool.
 
 | Tool | What it does |
 |------|--------------|
-| `alphacam_api_invoke` | Call any API method, or read/set any property, on the application, the drawing, or any geometry handle. |
+| `alphacam_api_invoke` | Call any API method, or read/set any property, on the application, the drawing, or any geometry handle. Accepts a list of calls to run as one batch (one permission prompt), feeding earlier results into later calls. |
 | `alphacam_api_inspect` | See what an object is and what methods/properties it has. |
 | `alphacam_api_release` | Free object handles after heavy scripting. |
 
