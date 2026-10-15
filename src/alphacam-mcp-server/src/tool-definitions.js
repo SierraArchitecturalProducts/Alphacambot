@@ -910,7 +910,7 @@ export const TOOL_DEFINITIONS = [
         },
         outputTo: {
           type: 'integer',
-          description: 'Output destination: 0 = disk file only, 1 = machine only, 2 = both, -1 = show dialog. Default -1.',
+          description: 'Output destination: 0 = disk file only (default; no dialog), 1 = machine only, 2 = both, -1 = show ALPHACAM\'s Output NC dialog (needs a click; not unattended).',
           enum: [-1, 0, 1, 2],
         },
         visibleOnly: {
@@ -1392,7 +1392,7 @@ export const TOOL_DEFINITIONS = [
   {
     name: 'alphacam_simulate',
     description:
-      "Close the loop on a 3D job: run ALPHACAM's solid simulation of every toolpath (Drawing.SolidSimulation), export the simulated stock as STL (GetUpdatedStockSTL), export the 3D model as STL, and compare them top-down on a height-map grid. Returns a verdict (OK / INCOMPLETE / GOUGE), max and mean material remaining, max gouge, the percentage of the footprint within deviationTolerance, and the worst spots with XY coordinates so you can see WHERE material is left (e.g. roughing terraces outside a finishing boundary) or where the tool cut below the model. Requires a material/panel (alphacam_specify_panel) and at least one solid/surface model. Comparison is 3-axis (top-down) — undercuts and vertical walls are not measured. Typical: 5-60 s; use background:true for dense jobs. Run this BEFORE alphacam_output_nc and fix the plan if the verdict is not OK.",
+      "Close the loop on a 3D job: run ALPHACAM's solid simulation of every toolpath (Drawing.SolidSimulation), export the simulated stock as STL (GetUpdatedStockSTL), export the 3D model as STL, and compare them top-down on a height-map grid. Returns a verdict (OK / INCOMPLETE / GOUGE), max and mean material remaining, max gouge, the percentage of the footprint within deviationTolerance, and the worst spots with XY coordinates so you can see WHERE material is left (e.g. roughing terraces outside a finishing boundary) or where the tool cut below the model. Requires a material/panel (alphacam_specify_panel) and at least one solid/surface model. Comparison is 3-axis (top-down) with deviations measured normal to the model surface (so steep walls do not read as gouges); undercuts and vertical walls are not measured. Typical: 5-60 s; use background:true for dense jobs. Run this BEFORE alphacam_output_nc and fix the plan if the verdict is not OK.",
     inputSchema: {
       type: 'object',
       properties: {

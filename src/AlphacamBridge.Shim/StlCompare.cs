@@ -116,9 +116,23 @@ namespace CambotAlphacam
 
         public class Spot { public double X, Y, Value, ModelZ, StockZ; }
 
+        // cos of the model's local slope at a cell (1 = flat, 0 = vertical),
+        // from central differences on the height map. NaN neighbours are
+        // treated as level so edges don't read as cliffs.
+        private static double CosSlope(double[,] hm, int i, int j, int n, double dx, double dy)
+        {
+            double z = hm[i, j];
+            double zl = i > 0 && !double.IsNaN(hm[i - 1, j]) ? hm[i - 1, j] : z;
+            double zr = i < n - 1 && !double.IsNaN(hm[i + 1, j]) ? hm[i + 1, j] : z;
+            double zd = j > 0 && !double.IsNaN(hm[i, j - 1]) ? hm[i, j - 1] : z;
+            double zu = j < n - 1 && !double.IsNaN(hm[i, j + 1]) ? hm[i, j + 1] : z;
+            double gx = (zr - zl) / (2 * dx), gy = (zu - zd) / (2 * dy);
+            return 1.0 / Math.Sqrt(1.0 + gx * gx + gy * gy);
+        }
+
         public class Report
         {
-            public int Cells, CoveredCells;
+            public int Cells, CoveredCells, SteepCells;
             public double MaxRemaining, MeanRemaining, MaxGouge, MeanGouge;
             public double PctWithinTolerance, PctRemainingAboveTolerance, PctGougeBeyondTolerance;
             public double AreaRemainingAboveTolerance; // drawing units²
@@ -143,7 +157,14 @@ namespace CambotAlphacam
                 for (int j = 0; j < n; j++)
                 {
                     if (double.IsNaN(hmM[i, j]) || double.IsNaN(hmS[i, j])) continue;
-                    double d = hmS[i, j] - hmM[i, j];
+                    // Deviation measured NORMAL to the model surface, not along
+                    // Z: dz * cos(slope). On a flat this is dz; on a steep wall a
+                    // one-cell XY straddle otherwise reads as a huge Z "gouge"
+                    // (0.03 phantom gouges on pocket walls, 2026-09-30).
+                    double cosSlope = CosSlope(hmM, i, j, n, dx, dy);
+                    double dzRaw = hmS[i, j] - hmM[i, j];
+                    double d = dzRaw * cosSlope;
+                    if (cosSlope < 0.2) r.SteepCells++;
                     r.CoveredCells++;
                     diffs.Add(Tuple.Create(i, j, d));
                     if (d > 0) { sumRem += d; nRem++; if (d > r.MaxRemaining) r.MaxRemaining = d; if (d > tolerance) nRemAbove++; }

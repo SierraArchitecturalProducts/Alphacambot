@@ -275,7 +275,10 @@ namespace CambotAlphacam
                     catch { }
                     if (defaultPath == null) defaultPath = Path.Combine(Path.GetTempPath(), "output.nc");
                     var ncPath = GetString(prms, "path", defaultPath);
-                    var outputTo = (short)GetInt(prms, "outputTo", -1);
+                    // Default 0 = file. -1 shows Alphacam's own "Output NC"
+                    // dialog (post + File/Machine/Both), which needs a click —
+                    // that was the "intervention" on every post of 2026-09-29.
+                    var outputTo = (short)GetInt(prms, "outputTo", 0);
                     var visibleOnly = GetBool(prms, "visibleOnly", true);
 
                     // ── Unattended mode: patch XilogPost.ini before OutputNC.
@@ -2681,7 +2684,7 @@ namespace CambotAlphacam
                             {
                                 double fx0, fy0, fx1, fy1;
                                 fx0 = fy0 = fx1 = fy1 = 0;
-                                p.GetFeedExtent(ref fx0, ref fy0, ref fx1, ref fy1);
+                                p.GetFeedExtentXYG(ref fx0, ref fy0, ref fx1, ref fy1); // global XY: local extents lie under a rotated work plane
                                 tpMinX = Math.Min(tpMinX, fx0); tpMinY = Math.Min(tpMinY, fy0); tpMaxX = Math.Max(tpMaxX, fx1); tpMaxY = Math.Max(tpMaxY, fy1);
                             }
                             catch { }
@@ -2713,15 +2716,17 @@ namespace CambotAlphacam
                         }
                     }
                     catch { }
+                    TopSurfaceInfo topInfo = null;
                     if (haveModelBounds && !double.IsInfinity(tpMinZ))
                     {
+                        topInfo = AnalyseTopSurface(drw, solidsSelected > 0, targets, stockTopZ);
                         if (roughing)
                         {
                             double stockZv = GetDouble(prms, "stockZ", GetDouble(prms, "stock", 0.0));
                             // The relevant floor is the lowest point of the
                             // model's TOP surface (what a 3-axis tool can
                             // reach), not the solid's minZ (its underside).
-                            double topMin = ModelTopSurfaceMinZ(drw, solidsSelected > 0, targets);
+                            double topMin = topInfo.TopMinZ;
                             if (double.IsNaN(topMin)) topMin = mMinZ;
                             double floorGap = tpMinZ - (topMin + stockZv);
                             if (floorGap > 0.02 * Math.Max(1.0, mMaxZ - mMinZ) + 1e-6)
@@ -2736,9 +2741,16 @@ namespace CambotAlphacam
                         }
                         if (!double.IsInfinity(tpMinX))
                         {
+                            // Compare against the footprint of material that
+                            // actually needs removing (model below the stock
+                            // top), not the whole model: a flat top face at
+                            // stock level needs no pass. Falls back to the
+                            // model bounds when the analysis failed.
+                            double cMinX = mMinX, cMinY = mMinY, cMaxX = mMaxX, cMaxY = mMaxY; string what = "model footprint";
+                            if (topInfo != null && !double.IsNaN(topInfo.CutMinX)) { cMinX = topInfo.CutMinX; cMinY = topInfo.CutMinY; cMaxX = topInfo.CutMaxX; cMaxY = topInfo.CutMaxY; what = "material-to-remove footprint"; }
                             double m = toolDia; // uncovered margin larger than a tool diameter is a real gap
-                            if (tpMinX > mMinX + m || tpMinY > mMinY + m || tpMaxX < mMaxX - m || tpMaxY < mMaxY - m)
-                                warnings.Add("Toolpaths span (" + Math.Round(tpMinX, 3) + "," + Math.Round(tpMinY, 3) + ")-(" + Math.Round(tpMaxX, 3) + "," + Math.Round(tpMaxY, 3) + ") but the model footprint is (" + Math.Round(mMinX, 3) + "," + Math.Round(mMinY, 3) + ")-(" + Math.Round(mMaxX, 3) + "," + Math.Round(mMaxY, 3) + "): part of the model is not covered by this operation.");
+                            if (tpMinX > cMinX + m || tpMinY > cMinY + m || tpMaxX < cMaxX - m || tpMaxY < cMaxY - m)
+                                warnings.Add("Toolpaths span (" + Math.Round(tpMinX, 3) + "," + Math.Round(tpMinY, 3) + ")-(" + Math.Round(tpMaxX, 3) + "," + Math.Round(tpMaxY, 3) + ") but the " + what + " is (" + Math.Round(cMinX, 3) + "," + Math.Round(cMinY, 3) + ")-(" + Math.Round(cMaxX, 3) + "," + Math.Round(cMaxY, 3) + "): part of it is not covered by this operation" + (roughing || key == "restmachining" || key == "rest" || key == "pencil" ? " (expected for strategies that only cut where material remains)" : "") + ".");
                         }
                     }
                     try { drw.Redraw(); } catch { }
@@ -2773,6 +2785,8 @@ namespace CambotAlphacam
                     if (pathIds.Count == 0) warnings.Add("Alphacam returned no toolpaths — check that the models sit within Z range of the tool, the boundary (if any) overlaps them, and the strategy applies to this model type.");
                     if (haveModelBounds) res3d["modelBounds"] = new Dictionary<string, object> { ["minX"] = mMinX, ["minY"] = mMinY, ["minZ"] = mMinZ, ["maxX"] = mMaxX, ["maxY"] = mMaxY, ["maxZ"] = mMaxZ };
                     if (!double.IsNaN(res3d_topMin)) res3d["modelTopSurfaceMinZ"] = Math.Round(res3d_topMin, 4);
+                    if (topInfo != null && !double.IsNaN(topInfo.CutMinX))
+                        res3d["materialToRemove"] = new Dictionary<string, object> { ["minX"] = Math.Round(topInfo.CutMinX, 3), ["minY"] = Math.Round(topInfo.CutMinY, 3), ["maxX"] = Math.Round(topInfo.CutMaxX, 3), ["maxY"] = Math.Round(topInfo.CutMaxY, 3), ["area"] = Math.Round(topInfo.CutArea, 3), ["stockTop"] = double.IsNaN(stockTopZ) ? (object)"model top" : Math.Round(stockTopZ, 4) };
                     if (!double.IsInfinity(tpMinZ)) res3d["toolpathZRange"] = new Dictionary<string, object> { ["min"] = Math.Round(tpMinZ, 4), ["max"] = Math.Round(tpMaxZ, 4), ["elementsScanned"] = elemsScanned, ["capped"] = elemsScanned >= ElemScanCap };
                     if (!double.IsInfinity(tpMinX)) res3d["toolpathXYExtent"] = new Dictionary<string, object> { ["minX"] = Math.Round(tpMinX, 4), ["minY"] = Math.Round(tpMinY, 4), ["maxX"] = Math.Round(tpMaxX, 4), ["maxY"] = Math.Round(tpMaxY, 4) };
                     if (warnings.Count > 0) res3d["warnings"] = warnings;
@@ -2872,7 +2886,8 @@ namespace CambotAlphacam
                     var spotsG = new List<object>(); foreach (var s in rep.WorstGouges) spotsG.Add(new Dictionary<string, object> { ["x"] = s.X, ["y"] = s.Y, ["gouge"] = s.Value, ["modelZ"] = s.ModelZ, ["stockZ"] = s.StockZ });
                     simRes["comparison"] = new Dictionary<string, object>
                     {
-                        ["method"] = "top-down height map (3-axis)",
+                        ["method"] = "top-down height map (3-axis); deviations are normal to the model surface (dz x cos slope)",
+                        ["steepCells"] = rep.SteepCells,
                         ["gridSize"] = grid,
                         ["deviationTolerance"] = cmpTol,
                         ["modelTriangles"] = model.Count, ["stockTriangles"] = stock.Count,
@@ -3529,22 +3544,56 @@ namespace CambotAlphacam
         // Lowest Z of the model's top surface (top-down height map of a quick
         // STL export). NaN when it can't be computed. Solids export as STL
         // type 1, surfaces as type 2.
-        private double ModelTopSurfaceMinZ(dynamic drw, bool solids, List<KeyValuePair<string, object>> onlyThese)
+        private sealed class TopSurfaceInfo
         {
+            public double TopMinZ = double.NaN;
+            // Bounding box of the cells that sit BELOW stockTop - eps: the
+            // area a 3-axis job actually has to machine. NaN when nothing does.
+            public double CutMinX = double.NaN, CutMinY = double.NaN, CutMaxX = double.NaN, CutMaxY = double.NaN;
+            public double CutArea;
+        }
+
+        // Quick STL export of the target models → top-down height map →
+        // lowest point of the TOP surface and the footprint of material to
+        // remove (cells below the stock top). NaN fields when unavailable.
+        private TopSurfaceInfo AnalyseTopSurface(dynamic drw, bool solids, List<KeyValuePair<string, object>> onlyThese, double stockTop)
+        {
+            var info = new TopSurfaceInfo();
             string tmp = null;
             try
             {
                 tmp = Path.Combine(Path.GetTempPath(), "AlphacamBridge-topmin-" + Guid.NewGuid().ToString("N") + ".stl");
                 ExportModelsStl(drw, tmp, solids ? 1 : 2, 0.01, onlyThese);
                 var tris = StlCompare.ReadStl(tmp);
-                if (tris.Count == 0) return double.NaN;
+                if (tris.Count == 0) return info;
                 double x0, y0, z0, x1, y1, z1; StlCompare.Bounds(tris, out x0, out y0, out z0, out x1, out y1, out z1);
-                var hm = StlCompare.HeightMap(tris, x0, y0, x1, y1, 80);
-                double min = double.PositiveInfinity;
-                for (int i = 0; i < 80; i++) for (int j = 0; j < 80; j++) if (!double.IsNaN(hm[i, j]) && hm[i, j] < min) min = hm[i, j];
-                return double.IsInfinity(min) ? double.NaN : min;
+                const int n = 120;
+                var hm = StlCompare.HeightMap(tris, x0, y0, x1, y1, n);
+                double dx = (x1 - x0) / n, dy = (y1 - y0) / n;
+                double top = double.IsNaN(stockTop) ? z1 : stockTop;
+                double eps = 0.002 * Math.Max(1.0, z1 - z0);
+                double min = double.PositiveInfinity; int cut = 0;
+                for (int i = 0; i < n; i++)
+                    for (int j = 0; j < n; j++)
+                    {
+                        double z = hm[i, j];
+                        if (double.IsNaN(z)) continue;
+                        if (z < min) min = z;
+                        if (z < top - eps)
+                        {
+                            cut++;
+                            double cx0 = x0 + i * dx, cy0 = y0 + j * dy;
+                            if (double.IsNaN(info.CutMinX) || cx0 < info.CutMinX) info.CutMinX = cx0;
+                            if (double.IsNaN(info.CutMinY) || cy0 < info.CutMinY) info.CutMinY = cy0;
+                            if (double.IsNaN(info.CutMaxX) || cx0 + dx > info.CutMaxX) info.CutMaxX = cx0 + dx;
+                            if (double.IsNaN(info.CutMaxY) || cy0 + dy > info.CutMaxY) info.CutMaxY = cy0 + dy;
+                        }
+                    }
+                info.TopMinZ = double.IsInfinity(min) ? double.NaN : min;
+                info.CutArea = cut * dx * dy;
+                return info;
             }
-            catch (Exception ex) { Log("ModelTopSurfaceMinZ: " + ex.Message); return double.NaN; }
+            catch (Exception ex) { Log("AnalyseTopSurface: " + ex.Message); return info; }
             finally { try { if (tmp != null && File.Exists(tmp)) File.Delete(tmp); } catch { } }
         }
 
