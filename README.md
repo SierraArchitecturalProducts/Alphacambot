@@ -1,8 +1,31 @@
-# Alphacambot
+# AlphaCambot
 
 **Drive Hexagon ALPHACAM® with plain English — from any AI agent that speaks MCP.**
 
-Alphacambot is an open-source [Model Context Protocol](https://modelcontextprotocol.io) (MCP)
+> ## WARNING — this software drives real machinery
+>
+> AlphaCambot generates toolpaths and NC programs that run on CNC machines. An error —
+> in this software, in the AI agent driving it, in the post processor, or in what you
+> asked for — can cause **fire, injury, death, and destruction of machines, tooling,
+> fixtures, and material**. Spindles, rapids, and plunges do not care that the program
+> came from a conversation.
+>
+> **Nothing produced by this software is guaranteed correct. Before any program reaches a
+> machine:**
+>
+> 1. **Inspect the toolpaths in ALPHACAM** — depths, rapid heights, lead-ins, tool side,
+>    order of operations.
+> 2. **Run ALPHACAM's solid simulation** and look at the result (the `alphacam_simulate`
+>    tool compares it against the model, but it is a 3-axis top-down check, not proof).
+> 3. **Verify the G-code itself** — post processor, tool numbers and offsets, work
+>    offsets, material size and position, spindle and feed values, safe Z.
+> 4. **Prove it out on the machine** with its own safeguards: dry run / air cut above the
+>    part, single block, feed and rapid override, hand on the stop.
+>
+> You, the operator, are solely responsible for everything that runs on your machine.
+> This software is provided "as is", without warranty of any kind (see [LICENSE](LICENSE)).
+
+AlphaCambot is an open-source [Model Context Protocol](https://modelcontextprotocol.io) (MCP)
 server for ALPHACAM CAD/CAM software. Any MCP-capable LLM agent — the
 [Claude Desktop app](https://claude.ai/download), or any other MCP client — can use it to
 draw geometry, apply machining, run true-shape nesting, and post NC programs from a
@@ -11,10 +34,14 @@ plain-English conversation:
 > "Draw a 24x12 panel, drill ten 8 mm holes along the bottom, profile the outside
 > with a ramped lead-in in two passes, and post the G-code."
 
-It exposes **67 tools** covering:
+It exposes **69 tools** covering:
 
-- **Drawing & CAD editing** — rectangles, circles, polygons, text, arbitrary 2D paths;
-  move/rotate/mirror/scale (with array patterns), offset, fillet/chamfer, join, explode
+- **Drawing & CAD editing** — rectangles, circles, polygons, editable text objects and
+  text-as-geometry, arbitrary 2D paths; move/rotate/mirror/scale (with array patterns),
+  offset, fillet/chamfer, join, explode
+- **Geometry lint** — one call finds and fixes NC-hostile geometry (huge-radius arcs,
+  micro elements, gaps, self-intersecting hooks, stacked duplicates) before it reaches
+  a part file, a nest or the machine
 - **Machining** — profile (rough/finish with helical descent, automatic lead-in/out,
   sloping/profiled sides and auto-Z levels), pocketing, drilling/tapping (batch),
   engraving, manual toolpaths
@@ -196,9 +223,9 @@ adding tools, and a long list of hard-won gotchas.
   output works but the post's normal dialog may appear.
 - True-shape nesting is the default engine; rectangular nesting is available as a
   fallback. Nesting runs typically take 30–60 seconds.
-- **Always review NC programs before running them on a machine.** This software
-  generates real toolpaths for real machinery; you are responsible for verifying
-  every program.
+- **Always review, simulate, and verify NC programs before running them on a
+  machine** — see the warning at the top of this file. This software generates real
+  toolpaths for real machinery; you are responsible for every program that runs.
 
 ## Trademarks and attribution
 
@@ -214,12 +241,13 @@ adding tools, and a long list of hard-won gotchas.
   of companies. **Node.js** is a trademark of the **OpenJS Foundation**.
 - All other trademarks are the property of their respective owners.
 
-Alphacambot was built by Sierra Hardware Products, Inc., in collaboration
+AlphaCambot was built by Sierra Hardware Products, Inc., in collaboration
 with Claude.
 
 ## License
 
 [MIT](LICENSE) — Copyright (c) 2026 Sierra Hardware Products, Inc.
 
-Provided "as is", without warranty of any kind. CNC machinery can cause injury and
-property damage; validate all generated toolpaths and programs before use.
+Provided "as is", without warranty of any kind. CNC machinery can cause fire, injury,
+death, and property damage; inspect, simulate, and verify every generated toolpath
+and program before use, and prove it out on the machine.

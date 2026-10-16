@@ -124,7 +124,7 @@ export const TOOL_DEFINITIONS = [
         y1: { type: 'number', description: 'Y coordinate of first corner' },
         x2: { type: 'number', description: 'X coordinate of opposite corner' },
         y2: { type: 'number', description: 'Y coordinate of opposite corner' },
-        layer: { type: 'string', description: 'Target layer name (optional)' },
+        layer: { type: 'string', description: 'Put the new geometry on this layer (created if missing). Default: the active layer.' },
       },
       required: ['x1', 'y1', 'x2', 'y2'],
     },
@@ -139,7 +139,7 @@ export const TOOL_DEFINITIONS = [
         diameter: { type: 'number', description: 'Circle diameter' },
         centerX: { type: 'number', description: 'X coordinate of center' },
         centerY: { type: 'number', description: 'Y coordinate of center' },
-        layer: { type: 'string', description: 'Target layer name (optional)' },
+        layer: { type: 'string', description: 'Put the new geometry on this layer (created if missing). Default: the active layer.' },
       },
       required: ['diameter', 'centerX', 'centerY'],
     },
@@ -155,7 +155,7 @@ export const TOOL_DEFINITIONS = [
         y1: { type: 'number', description: 'Y coordinate of start point' },
         x2: { type: 'number', description: 'X coordinate of end point' },
         y2: { type: 'number', description: 'Y coordinate of end point' },
-        layer: { type: 'string', description: 'Target layer name (optional)' },
+        layer: { type: 'string', description: 'Put the new geometry on this layer (created if missing). Default: the active layer.' },
       },
       required: ['x1', 'y1', 'x2', 'y2'],
     },
@@ -175,7 +175,7 @@ export const TOOL_DEFINITIONS = [
         },
         centerX: { type: 'number', description: 'X coordinate of center' },
         centerY: { type: 'number', description: 'Y coordinate of center' },
-        layer: { type: 'string', description: 'Target layer name (optional)' },
+        layer: { type: 'string', description: 'Put the new geometry on this layer (created if missing). Default: the active layer.' },
       },
       required: ['diameter', 'numSides', 'centerX', 'centerY'],
     },
@@ -183,7 +183,7 @@ export const TOOL_DEFINITIONS = [
   {
     name: 'alphacam_create_text',
     description:
-      'Create text as geometry lines and arcs (Drawing.CreateText). Text is converted to cuttable geometry (not annotation). Font must start with "A" for Alphacam font (e.g., "AStencil") or "T" for TrueType (e.g., "TArial"). Returns a Paths collection.',
+      'Create text as CUTTABLE geometry lines and arcs (Drawing.CreateText) — for engraving or cutting letter shapes. For labels, part numbers, notes or any annotation a person may edit later, use alphacam_text instead (real editable Text objects). Font must start with "A" for Alphacam font (e.g., "AStencil") or "T" for TrueType (e.g., "TArial"). Returns the geometry ids.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -195,7 +195,7 @@ export const TOOL_DEFINITIONS = [
           type: 'string',
           description: 'Font name. Prefix "A" for Alphacam font, "T" for TrueType (e.g., "TArial"). Default: Alphacam default.',
         },
-        layer: { type: 'string', description: 'Target layer name (optional)' },
+        layer: { type: 'string', description: 'Put the new geometry on this layer (created if missing). Default: the active layer.' },
       },
       required: ['text', 'x', 'y', 'height'],
     },
@@ -219,7 +219,7 @@ export const TOOL_DEFINITIONS = [
           type: 'integer',
           description: 'Number of arcs per quadrant (higher = smoother, default 4)',
         },
-        layer: { type: 'string', description: 'Target layer name (optional)' },
+        layer: { type: 'string', description: 'Put the new geometry on this layer (created if missing). Default: the active layer.' },
       },
       required: ['width', 'height', 'centerX', 'centerY'],
     },
@@ -256,7 +256,7 @@ export const TOOL_DEFINITIONS = [
           type: 'boolean',
           description: 'True to close geometry (CloseAndFinishLine). False for open geometry (FinishLine). Default: false.',
         },
-        layer: { type: 'string', description: 'Target layer name (optional)' },
+        layer: { type: 'string', description: 'Put the new geometry on this layer (created if missing). Default: the active layer.' },
       },
       required: ['startX', 'startY', 'segments'],
     },
@@ -1614,6 +1614,79 @@ export const TOOL_DEFINITIONS = [
         objectId: { type: 'string', description: 'One id to release.' },
         objectIds: { type: 'array', items: { type: 'string' }, description: 'Several ids to release.' },
         all: { type: 'boolean', description: 'Release every cached handle.' },
+      },
+    },
+  },
+  {
+    name: 'alphacam_check_geometry',
+    description:
+      'Lint geometry for NC-hostile elements and optionally fix it in place. One call scans every element of the scoped paths inside ALPHACAM and returns a compact report — no element data crosses the pipe. ' +
+      'Finds: bigArc (radius over maxArcRadius; these overflow I/J words and trip arc-radius alarms on the control), tiny (elements under minLength), gap (joint gaps between consecutive elements), spike (tangent reversal at a joint next to a short element — the self-intersecting hooks that stop machining styles from applying), selfIntersect, nearlyClosed (open path whose ends almost meet), nonZeroZ, and stacked duplicates (same layer, same bbox/element count/length). ' +
+      'Scope: layer/layers, geometryIds, selected:true, interactive:true, or omit for the whole drawing; excludeLayers and within:{minX,minY,maxX,maxY} (e.g. the nested sheet) narrow it. ' +
+      'fix:true rebuilds only the flagged paths via Path.ReplaceElements (same id, layer, tool side, start point and direction): big arcs become chords within chordTolerance (0.0005"), micro elements and spike elements are dropped, joint gaps closed, nearly-closed paths closed. Duplicates are deleted only with deleteDuplicates:true (all but the first copy). ' +
+      'Thresholds default to inch values; pass units:"mm" to scale them, or set them explicitly. Run it after alphacam_import_cad (fonts, DXF/DWG from artwork) and before saving parts or nesting; after a fix, regenerate toolpaths on the rebuilt geometries. Large drawings: background:true + alphacam_job_status.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        layer: { type: 'string', description: 'Scan this layer.' },
+        layers: { type: 'array', items: { type: 'string' }, description: 'Scan these layers.' },
+        geometryIds: { type: 'array', items: { type: 'string' }, description: 'Scan these geometry ids.' },
+        geometryId: { type: 'string' },
+        selected: { type: 'boolean', description: 'Scan the geometries currently selected in ALPHACAM.' },
+        interactive: { type: 'boolean', description: 'Prompt the user to pick geometries.' },
+        excludeLayers: { type: 'array', items: { type: 'string' }, description: 'Layers to skip (e.g. construction, dimension, part map).' },
+        within: {
+          type: 'object',
+          description: 'Only geometries whose bounding box lies inside this rectangle (e.g. the nested sheet).',
+          properties: { minX: { type: 'number' }, minY: { type: 'number' }, maxX: { type: 'number' }, maxY: { type: 'number' } },
+        },
+        fix: { type: 'boolean', description: 'Rebuild flagged paths in place. Default false (report only).' },
+        deleteDuplicates: { type: 'boolean', description: 'With fix:true, delete stacked duplicate copies (keeps the first). Default false.' },
+        units: { type: 'string', enum: ['inch', 'mm'], description: 'Scales the default thresholds (inch defaults ×25.4 for mm). Default inch.' },
+        maxArcRadius: { type: 'number', description: 'Arcs with a larger radius are flagged/chorded. Default 100 (inch) / 2540 (mm).' },
+        minLength: { type: 'number', description: 'Elements shorter than this are flagged/dropped. Default 0.001 / 0.0254.' },
+        gapTolerance: { type: 'number', description: 'Joint gap above this is flagged. Default 0.0001 / 0.00254.' },
+        spikeTurnDegrees: { type: 'number', description: 'Tangent turn at a joint above this counts as a reversal. Default 150.' },
+        spikeMaxLength: { type: 'number', description: 'Only elements shorter than this are treated as spikes at a reversal. Default 0.01 / 0.254.' },
+        nearlyClosedTolerance: { type: 'number', description: 'Open path with ends closer than this is "nearlyClosed". Default 0.01 / 0.254.' },
+        chordTolerance: { type: 'number', description: 'Max deviation when a big arc is replaced by chords. Default 0.0005 / 0.0127.' },
+        selfIntersection: { type: 'boolean', description: 'Run the O(n²) self-intersection test (skipped automatically above 4000 flattened segments). Default true.' },
+        maxReport: { type: 'integer', description: 'Max flagged geometries listed in detail. Default 60 (counts are always complete).' },
+        maxIssuesPerGeometry: { type: 'integer', description: 'Default 8.' },
+        background: { type: 'boolean', description: 'Return a jobId and poll alphacam_job_status.' },
+      },
+    },
+  },
+  {
+    name: 'alphacam_text',
+    description:
+      'Real TEXT objects (editable annotation, Drawing.CreateText2 / Drawing.Text): create, list, edit, delete, or convert to geometry. Use this for labels, part numbers, notes, part maps and anything a person may later edit in ALPHACAM — NOT alphacam_create_text, which renders the characters as line/arc geometry for cutting. ' +
+      'create: text (use \n for several lines), x, y (left/bottom of the first line unless justify changes it), height, optional font ("A…" ALPHACAM font e.g. AStencil, "T…" TrueType e.g. TArial), justify, rotation (degrees), bold, italic, lineSpacing, spacing, widthScale, layer (created if missing); or pathGeometryId + characterGap to run the text along a geometry. ' +
+      'list: every text object (textId, text, position, height, font, layer, bounds); filter by layer or selected:true. ' +
+      'edit: textId/textIds or selected:true plus any of the create properties; a new text with fewer lines than before recreates the object (new textId returned). ' +
+      'delete: textId/textIds or selected. toGeometry: convert to cuttable line/arc geometry (the text object is deleted; returns geometryIds).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['create', 'list', 'edit', 'delete', 'toGeometry'], description: 'Default create.' },
+        text: { type: 'string', description: 'The text; \n separates lines.' },
+        x: { type: 'number', description: 'Location X (base point).' },
+        y: { type: 'number', description: 'Location Y (base point).' },
+        height: { type: 'number', description: 'Character height in drawing units.' },
+        font: { type: 'string', description: '"A<name>" ALPHACAM font or "T<name>" TrueType (e.g. TArial).' },
+        justify: { type: 'string', enum: ['left', 'center', 'right', 'scaled'] },
+        rotation: { type: 'number', description: 'Degrees, CCW positive.' },
+        bold: { type: 'boolean' },
+        italic: { type: 'boolean' },
+        lineSpacing: { type: 'number', description: 'Multiple of the height.' },
+        spacing: { type: 'number', description: 'Character spacing as a multiple of the height.' },
+        widthScale: { type: 'number', description: 'Character width scale factor.' },
+        layer: { type: 'string', description: 'create/edit: put the text on this layer (created if missing). list: filter by layer.' },
+        pathGeometryId: { type: 'string', description: 'create: run the text along this geometry (CreateTextAlongPath2).' },
+        characterGap: { type: 'number', description: 'create along path: gap between characters.' },
+        textId: { type: 'string', description: 'edit/delete/toGeometry target (from list or create).' },
+        textIds: { type: 'array', items: { type: 'string' } },
+        selected: { type: 'boolean', description: 'edit/delete/toGeometry: the text objects selected in ALPHACAM; list: only selected ones.' },
       },
     },
   },

@@ -171,7 +171,7 @@ namespace CambotAlphacam
         }
         private static readonly HashSet<string> BackgroundMethods = new HashSet<string>
         {
-            "alphacam.output_nc", "alphacam.machine_3d", "alphacam.simulate", "alphacam.import_cad", "alphacam.nest",
+            "alphacam.output_nc", "alphacam.machine_3d", "alphacam.simulate", "alphacam.import_cad", "alphacam.nest", "alphacam.check_geometry",
         };
         private readonly Dictionary<string, JobInfo> _jobs = new Dictionary<string, JobInfo>();
         private int _nextJobId = 1;
@@ -393,28 +393,40 @@ namespace CambotAlphacam
                 {
                     dynamic drw = _app.ActiveDrawing;
                     dynamic path = drw.CreateRectangle(GetDouble(prms, "x1"), GetDouble(prms, "y1"), GetDouble(prms, "x2"), GetDouble(prms, "y2"));
-                    return new Dictionary<string, object> { ["geometryId"] = StoreObject(path) };
+                    var res = new Dictionary<string, object> { ["geometryId"] = StoreObject(path) };
+                    var lay = ApplyLayerParam(drw, prms, (object)path);
+                    if (lay != null) res["layer"] = lay;
+                    return res;
                 }
 
                 case "alphacam.create_circle":
                 {
                     dynamic drw = _app.ActiveDrawing;
                     dynamic path = drw.CreateCircle(GetDouble(prms, "diameter"), GetDouble(prms, "centerX"), GetDouble(prms, "centerY"));
-                    return new Dictionary<string, object> { ["geometryId"] = StoreObject(path) };
+                    var res = new Dictionary<string, object> { ["geometryId"] = StoreObject(path) };
+                    var lay = ApplyLayerParam(drw, prms, (object)path);
+                    if (lay != null) res["layer"] = lay;
+                    return res;
                 }
 
                 case "alphacam.create_line":
                 {
                     dynamic drw = _app.ActiveDrawing;
                     dynamic path = drw.Create2DLine(GetDouble(prms, "x1"), GetDouble(prms, "y1"), GetDouble(prms, "x2"), GetDouble(prms, "y2"));
-                    return new Dictionary<string, object> { ["geometryId"] = StoreObject(path) };
+                    var res = new Dictionary<string, object> { ["geometryId"] = StoreObject(path) };
+                    var lay = ApplyLayerParam(drw, prms, (object)path);
+                    if (lay != null) res["layer"] = lay;
+                    return res;
                 }
 
                 case "alphacam.create_polygon":
                 {
                     dynamic drw = _app.ActiveDrawing;
                     dynamic path = drw.CreatePolygon(GetDouble(prms, "diameter"), GetInt(prms, "numSides"), GetBool(prms, "insideCircle", false), GetDouble(prms, "centerX"), GetDouble(prms, "centerY"));
-                    return new Dictionary<string, object> { ["geometryId"] = StoreObject(path) };
+                    var res = new Dictionary<string, object> { ["geometryId"] = StoreObject(path) };
+                    var lay = ApplyLayerParam(drw, prms, (object)path);
+                    if (lay != null) res["layer"] = lay;
+                    return res;
                 }
 
                 case "alphacam.create_text":
@@ -427,16 +439,23 @@ namespace CambotAlphacam
                     }
                     dynamic paths = drw.CreateText(GetString(prms, "text"), GetDouble(prms, "x"), GetDouble(prms, "y"), GetDouble(prms, "height"));
                     var ids = new List<string>();
+                    var objs = new List<object>();
                     int count = (int)paths.Count;
-                    for (int i = 1; i <= count; i++) ids.Add(StoreObject(paths.Item(i)));
-                    return new Dictionary<string, object> { ["geometryIds"] = ids };
+                    for (int i = 1; i <= count; i++) { dynamic pth = paths.Item(i); ids.Add(StoreObject(pth)); objs.Add((object)pth); }
+                    var ctRes = new Dictionary<string, object> { ["geometryIds"] = ids };
+                    var ctLay = ApplyLayerParam(drw, prms, objs.ToArray());
+                    if (ctLay != null) ctRes["layer"] = ctLay;
+                    return ctRes;
                 }
 
                 case "alphacam.create_ellipse":
                 {
                     dynamic drw = _app.ActiveDrawing;
                     dynamic path = drw.CreateEllipse(GetDouble(prms, "width"), GetDouble(prms, "height"), (short)GetInt(prms, "numQuads", 4), (short)GetInt(prms, "arcsPerQuad", 4), GetDouble(prms, "centerX"), GetDouble(prms, "centerY"));
-                    return new Dictionary<string, object> { ["geometryId"] = StoreObject(path) };
+                    var res = new Dictionary<string, object> { ["geometryId"] = StoreObject(path) };
+                    var lay = ApplyLayerParam(drw, prms, (object)path);
+                    if (lay != null) res["layer"] = lay;
+                    return res;
                 }
 
                 case "alphacam.create_2d_geometry":
@@ -457,7 +476,10 @@ namespace CambotAlphacam
                         }
                     }
                     dynamic result = GetBool(prms, "closed", false) ? geo.CloseAndFinishLine : geo.Finish;
-                    return new Dictionary<string, object> { ["geometryId"] = StoreObject(result) };
+                    var g2Res = new Dictionary<string, object> { ["geometryId"] = StoreObject(result) };
+                    var g2Lay = ApplyLayerParam(drw, prms, (object)result);
+                    if (g2Lay != null) g2Res["layer"] = g2Lay;
+                    return g2Res;
                 }
 
                 case "alphacam.list_geometries":
@@ -3028,8 +3050,588 @@ namespace CambotAlphacam
                     return new Dictionary<string, object> { ["released"] = released };
                 }
 
+                case "alphacam.check_geometry":
+                    return CheckGeometry(prms);
+
+                case "alphacam.text":
+                    return TextTool(prms);
+
                 default:
                     throw new InvalidOperationException("Unknown method: " + method);
+            }
+        }
+
+        // Honour the optional "layer" param on the create_* tools: move the
+        // new path(s) onto that layer, creating it if needed. Returns the
+        // layer name actually applied (null if none requested).
+        private string ApplyLayerParam(dynamic drw, Dictionary<string, object> prms, params object[] paths)
+        {
+            if (!prms.ContainsKey("layer")) return null;
+            var ln = GetString(prms, "layer", "");
+            if (string.IsNullOrEmpty(ln)) return null;
+            dynamic layer = FindLayerByName(drw, ln);
+            if (layer == null) layer = drw.CreateLayer(ln);
+            foreach (var o in paths)
+            {
+                if (o == null) continue;
+                dynamic d = o;
+                d.SetLayer(layer);
+            }
+            try { return (string)layer.Name; } catch { return ln; }
+        }
+
+        // ── Geometry lint (alphacam.check_geometry) ─────────────────
+
+        // Read a path's elements once into Seg records (global coordinates).
+        private List<Seg> ReadSegments(dynamic geo)
+        {
+            var segs = new List<Seg>();
+            int count = 0;
+            try { count = (int)geo.GetElemCount(); } catch { }
+            dynamic el = null;
+            try { el = geo.GetFirstElem(); } catch { }
+            for (int i = 0; i < count && el != null; i++)
+            {
+                var s = new Seg();
+                try { s.IsArc = (bool)el.IsArc; } catch { }
+                s.Sx = (double)el.StartXG; s.Sy = (double)el.StartYG;
+                s.Ex = (double)el.EndXG; s.Ey = (double)el.EndYG;
+                try { s.Sz = (double)el.StartZG; s.Ez = (double)el.EndZG; } catch { }
+                try { s.Len = (double)el.Length; } catch { s.Len = GeoLint.Dist(s.Sx, s.Sy, s.Ex, s.Ey); }
+                if (s.IsArc)
+                {
+                    try { s.Cx = (double)el.CenterXG; s.Cy = (double)el.CenterYG; s.R = (double)el.Radius; s.CW = (bool)el.CW; }
+                    catch { s.IsArc = false; }
+                }
+                dynamic next = null;
+                try { next = el.GetNext(); } catch { }
+                el = next;
+                segs.Add(s);
+            }
+            return segs;
+        }
+
+        private static bool PathIsClosed(dynamic geo, List<Seg> segs)
+        {
+            try { return (bool)geo.Closed; } catch { }
+            if (segs.Count == 0) return false;
+            return GeoLint.Dist(segs[0].Sx, segs[0].Sy, segs[segs.Count - 1].Ex, segs[segs.Count - 1].Ey) < 1e-6;
+        }
+
+        // Rebuild a path in place from Seg records: Create2DGeometry +
+        // AddLine/AddArcPointCenter + Finish, then Path.ReplaceElements so the
+        // original keeps its id, layer, tool side and attributes.
+        private void RebuildPath(dynamic drw, dynamic geo, List<Seg> segs, bool closed)
+        {
+            if (segs.Count == 0) throw new InvalidOperationException("Nothing left to rebuild");
+            dynamic np = drw.Create2DGeometry(segs[0].Sx, segs[0].Sy);
+            foreach (var s in segs)
+            {
+                if (s.IsArc) np.AddArcPointCenter(s.Ex, s.Ey, s.Cx, s.Cy, s.CW);
+                else np.AddLine(s.Ex, s.Ey);
+            }
+            dynamic fin = np.Finish();
+            if (closed)
+            {
+                bool ok = false;
+                try { ok = (bool)fin.Closed; } catch { }
+                if (!ok)
+                {
+                    try { fin.Delete(); } catch { }
+                    np = drw.Create2DGeometry(segs[0].Sx, segs[0].Sy);
+                    foreach (var s in segs)
+                    {
+                        if (s.IsArc) np.AddArcPointCenter(s.Ex, s.Ey, s.Cx, s.Cy, s.CW);
+                        else np.AddLine(s.Ex, s.Ey);
+                    }
+                    fin = np.CloseAndFinishLine();
+                }
+            }
+            geo.ReplaceElements(fin);
+            try { fin.Delete(); } catch { }
+        }
+
+        // Scope: geometryIds / selected / interactive / layer(s) / all, then
+        // optional excludeLayers and a 'within' bounding box.
+        private List<KeyValuePair<string, object>> ResolveLintScope(dynamic drw, Dictionary<string, object> prms)
+        {
+            List<KeyValuePair<string, object>> list;
+            var layerNames = new List<string>();
+            if (prms.ContainsKey("layers"))
+            {
+                var arr = prms["layers"] as System.Collections.ArrayList;
+                if (arr != null) foreach (var o in arr) layerNames.Add(Convert.ToString(o));
+            }
+            if (prms.ContainsKey("layer")) layerNames.Add(GetString(prms, "layer", ""));
+            layerNames.RemoveAll(string.IsNullOrEmpty);
+
+            if (prms.ContainsKey("geometryIds") || prms.ContainsKey("geometryId") || GetBool(prms, "selected", false) || GetBool(prms, "interactive", false))
+                list = ResolveGeometryList(prms);
+            else if (layerNames.Count > 0)
+            {
+                list = new List<KeyValuePair<string, object>>();
+                foreach (var ln in layerNames)
+                {
+                    dynamic layer = FindLayerByName(drw, ln);
+                    if (layer == null) throw new ArgumentException("Layer not found: " + ln);
+                    dynamic geos = layer.Geometries;
+                    int c = 0; try { c = (int)geos.Count; } catch { }
+                    for (int i = 1; i <= c; i++) { dynamic g = geos.Item(i); list.Add(new KeyValuePair<string, object>(StoreObject(g), (object)g)); }
+                }
+            }
+            else
+            {
+                list = new List<KeyValuePair<string, object>>();
+                dynamic geos = drw.Geometries;
+                int c = 0; try { c = (int)geos.Count; } catch { }
+                for (int i = 1; i <= c; i++) { dynamic g = geos.Item(i); list.Add(new KeyValuePair<string, object>(StoreObject(g), (object)g)); }
+            }
+
+            var exclude = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            if (prms.ContainsKey("excludeLayers"))
+            {
+                var arr = prms["excludeLayers"] as System.Collections.ArrayList;
+                if (arr != null) foreach (var o in arr) exclude.Add(Convert.ToString(o));
+            }
+            Dictionary<string, object> within = prms.ContainsKey("within") ? prms["within"] as Dictionary<string, object> : null;
+            if (exclude.Count == 0 && within == null) return list;
+
+            var filtered = new List<KeyValuePair<string, object>>();
+            double wx0 = within != null ? GetDouble(within, "minX", double.MinValue) : double.MinValue;
+            double wy0 = within != null ? GetDouble(within, "minY", double.MinValue) : double.MinValue;
+            double wx1 = within != null ? GetDouble(within, "maxX", double.MaxValue) : double.MaxValue;
+            double wy1 = within != null ? GetDouble(within, "maxY", double.MaxValue) : double.MaxValue;
+            const double wtol = 0.01;
+            foreach (var kv in list)
+            {
+                dynamic g = kv.Value;
+                if (exclude.Count > 0)
+                {
+                    string ln = null;
+                    try { ln = (string)g.GetLayer().Name; } catch { }
+                    if (ln != null && exclude.Contains(ln)) continue;
+                }
+                if (within != null)
+                {
+                    double x0, y0, x1, y1;
+                    GeometryBounds(g, out x0, out y0, out x1, out y1);
+                    if (x0 < wx0 - wtol || y0 < wy0 - wtol || x1 > wx1 + wtol || y1 > wy1 + wtol) continue;
+                }
+                filtered.Add(kv);
+            }
+            return filtered;
+        }
+
+        private Dictionary<string, object> CheckGeometry(Dictionary<string, object> prms)
+        {
+            dynamic drw = _app.ActiveDrawing;
+            var o = new LintOptions();
+            double unitScale = string.Equals(GetString(prms, "units", "inch"), "mm", StringComparison.OrdinalIgnoreCase) ? 25.4 : 1.0;
+            o.MaxArcRadius = GetDouble(prms, "maxArcRadius", 100 * unitScale);
+            o.MinLength = GetDouble(prms, "minLength", 0.001 * unitScale);
+            o.GapTol = GetDouble(prms, "gapTolerance", 1e-4 * unitScale);
+            o.SpikeTurnDeg = GetDouble(prms, "spikeTurnDegrees", 150);
+            o.SpikeMaxLength = GetDouble(prms, "spikeMaxLength", 0.01 * unitScale);
+            o.NearlyClosedTol = GetDouble(prms, "nearlyClosedTolerance", 0.01 * unitScale);
+            o.ChordTol = GetDouble(prms, "chordTolerance", 0.0005 * unitScale);
+            o.FlattenTol = GetDouble(prms, "flattenTolerance", 0.001 * unitScale);
+            bool fix = GetBool(prms, "fix", false);
+            bool deleteDuplicates = GetBool(prms, "deleteDuplicates", false);
+            bool checkIntersect = GetBool(prms, "selfIntersection", true);
+            int maxReport = GetInt(prms, "maxReport", 60);
+            int maxIssuesPer = GetInt(prms, "maxIssuesPerGeometry", 8);
+            if (!checkIntersect) o.MaxSegmentsForIntersect = 0;
+
+            var scope = ResolveLintScope(drw, prms);
+            var perLayer = new Dictionary<string, Dictionary<string, int>>();
+            var totals = new Dictionary<string, int>();
+            var report = new List<Dictionary<string, object>>();
+            var fixedList = new List<Dictionary<string, object>>();
+            var fixErrors = new List<string>();
+            int flaggedGeos = 0, openCount = 0, scanned = 0;
+            var dupKeys = new Dictionary<string, List<string>>();
+            var dupGeo = new Dictionary<string, object>();
+            var dupLayerById = new Dictionary<string, string>();
+
+            foreach (var kv in scope)
+            {
+                dynamic g = kv.Value;
+                string layerName = "";
+                try { layerName = (string)g.GetLayer().Name; } catch { }
+                List<Seg> segs = ReadSegments(g);
+                if (segs.Count == 0) continue;
+                scanned++;
+                bool closed = (bool)PathIsClosed(g, segs);
+                if (!closed) openCount++;
+                List<Issue> issues = GeoLint.Analyse(segs, closed, o);
+
+                double x0, y0, x1, y1;
+                GeometryBounds(g, out x0, out y0, out x1, out y1);
+                double totalLen = 0; foreach (var s in segs) totalLen += s.Len;
+                string key = layerName + "|" + Math.Round(x0, 3) + "," + Math.Round(y0, 3) + "," + Math.Round(x1, 3) + "," + Math.Round(y1, 3) + "|" + segs.Count + "|" + Math.Round(totalLen, 3);
+                List<string> grp;
+                if (!dupKeys.TryGetValue(key, out grp)) { grp = new List<string>(); dupKeys[key] = grp; }
+                grp.Add(kv.Key); dupGeo[kv.Key] = g; dupLayerById[kv.Key] = layerName;
+
+                if (issues.Count == 0) continue;
+                flaggedGeos++;
+                Dictionary<string, int> lc;
+                if (!perLayer.TryGetValue(layerName, out lc)) { lc = new Dictionary<string, int>(); perLayer[layerName] = lc; }
+                foreach (var iss in issues)
+                {
+                    int v; lc.TryGetValue(iss.Type, out v); lc[iss.Type] = v + 1;
+                    totals.TryGetValue(iss.Type, out v); totals[iss.Type] = v + 1;
+                }
+
+                var entry = new Dictionary<string, object>
+                {
+                    ["geometryId"] = kv.Key,
+                    ["layer"] = layerName,
+                    ["closed"] = closed,
+                    ["elementCount"] = segs.Count,
+                    ["bounds"] = new Dictionary<string, object> { ["minX"] = Math.Round(x0, 4), ["minY"] = Math.Round(y0, 4), ["maxX"] = Math.Round(x1, 4), ["maxY"] = Math.Round(y1, 4) }
+                };
+                var il = new List<Dictionary<string, object>>();
+                foreach (var iss in issues)
+                {
+                    if (il.Count >= maxIssuesPer) break;
+                    var d = new Dictionary<string, object> { ["type"] = iss.Type, ["x"] = Math.Round(iss.X, 4), ["y"] = Math.Round(iss.Y, 4) };
+                    if (iss.Index >= 0) d["element"] = iss.Index;
+                    if (iss.Value != 0) d["value"] = Math.Round(iss.Value, 6);
+                    if (iss.Note != null) d["note"] = iss.Note;
+                    il.Add(d);
+                }
+                entry["issues"] = il;
+                if (issues.Count > il.Count) entry["issuesTruncated"] = issues.Count - il.Count;
+
+                bool fixable = issues.Exists(i => i.Type == "bigArc" || i.Type == "tiny" || i.Type == "gap" || i.Type == "spike" || i.Type == "nearlyClosed");
+                if (fix && fixable)
+                {
+                    try
+                    {
+                        bool wantClosed = closed || issues.Exists(i => i.Type == "nearlyClosed");
+                        var stats = new Dictionary<string, int>();
+                        var rebuilt = GeoLint.Rebuild(segs, wantClosed, o, stats);
+                        RebuildPath(drw, g, rebuilt, wantClosed);
+                        List<Seg> after = ReadSegments(g);
+                        bool afterClosed = (bool)PathIsClosed(g, after);
+                        List<Issue> remaining = GeoLint.Analyse(after, afterClosed, o);
+                        double nx0, ny0, nx1, ny1;
+                        GeometryBounds(g, out nx0, out ny0, out nx1, out ny1);
+                        var f = new Dictionary<string, object>
+                        {
+                            ["geometryId"] = kv.Key,
+                            ["layer"] = layerName,
+                            ["elementsBefore"] = segs.Count,
+                            ["elementsAfter"] = after.Count,
+                            ["closed"] = afterClosed,
+                            ["boundsShift"] = Math.Round(Math.Max(Math.Max(Math.Abs(nx0 - x0), Math.Abs(ny0 - y0)), Math.Max(Math.Abs(nx1 - x1), Math.Abs(ny1 - y1))), 6),
+                            ["changes"] = stats,
+                            ["remainingIssues"] = remaining.ConvertAll(i => i.Type)
+                        };
+                        fixedList.Add(f);
+                        entry["fixed"] = true;
+                    }
+                    catch (Exception ex) { fixErrors.Add(kv.Key + ": " + ex.GetType().Name + ": " + ex.Message); entry["fixed"] = false; }
+                }
+                if (report.Count < maxReport) report.Add(entry);
+            }
+
+            // Stacked duplicates (same layer, same bbox / element count / length).
+            var dupGroups = new List<Dictionary<string, object>>();
+            int dupDeleted = 0;
+            foreach (var kv in dupKeys)
+            {
+                if (kv.Value.Count < 2) continue;
+                var grpInfo = new Dictionary<string, object> { ["layer"] = dupLayerById[kv.Value[0]], ["geometryIds"] = kv.Value };
+                if (fix && deleteDuplicates)
+                {
+                    var removed = new List<string>();
+                    for (int i = 1; i < kv.Value.Count; i++)
+                    {
+                        try { dynamic g = dupGeo[kv.Value[i]]; g.Delete(); RemoveFromCache(kv.Value[i]); removed.Add(kv.Value[i]); dupDeleted++; }
+                        catch (Exception ex) { fixErrors.Add(kv.Value[i] + ": " + ex.Message); }
+                    }
+                    grpInfo["deleted"] = removed;
+                }
+                dupGroups.Add(grpInfo);
+            }
+            if (dupGroups.Count > 0) totals["duplicateGroups"] = dupGroups.Count;
+
+            var result = new Dictionary<string, object>
+            {
+                ["scanned"] = scanned,
+                ["open"] = openCount,
+                ["flagged"] = flaggedGeos,
+                ["totals"] = totals,
+                ["perLayer"] = perLayer,
+                ["thresholds"] = new Dictionary<string, object>
+                {
+                    ["maxArcRadius"] = o.MaxArcRadius, ["minLength"] = o.MinLength, ["gapTolerance"] = o.GapTol,
+                    ["spikeTurnDegrees"] = o.SpikeTurnDeg, ["spikeMaxLength"] = o.SpikeMaxLength,
+                    ["nearlyClosedTolerance"] = o.NearlyClosedTol, ["chordTolerance"] = o.ChordTol
+                },
+                ["geometries"] = report,
+                ["duplicates"] = dupGroups
+            };
+            if (report.Count < flaggedGeos) result["reportTruncated"] = flaggedGeos - report.Count;
+            if (fix)
+            {
+                result["fixed"] = fixedList;
+                result["fixedCount"] = fixedList.Count;
+                result["duplicatesDeleted"] = dupDeleted;
+                if (fixErrors.Count > 0) result["fixErrors"] = fixErrors;
+                if (fixedList.Count > 0 || dupDeleted > 0)
+                {
+                    try { drw.Redraw(); } catch { }
+                    result["note"] = "Geometries were rebuilt in place (same ids, layers, tool sides); existing toolpaths on them do not follow — regenerate operations. Drawing is unsaved.";
+                }
+            }
+            else if (flaggedGeos > 0)
+                result["nextStep"] = "Re-run with fix:true to rebuild the flagged paths in place (big arcs to chords within chordTolerance, micro elements and spikes removed, gaps closed). Add deleteDuplicates:true to drop stacked copies.";
+            return result;
+        }
+
+        // ── Text objects (alphacam.text) ─────────────────────────────
+
+        private List<KeyValuePair<string, object>> ResolveTexts(dynamic drw, Dictionary<string, object> prms, bool required)
+        {
+            var list = new List<KeyValuePair<string, object>>();
+            var ids = new List<string>();
+            if (prms.ContainsKey("textIds"))
+            {
+                var arr = prms["textIds"] as System.Collections.ArrayList;
+                if (arr != null) foreach (var o in arr) { var s = Convert.ToString(o); if (!string.IsNullOrEmpty(s)) ids.Add(s); }
+            }
+            if (prms.ContainsKey("textId")) { var s = GetString(prms, "textId", ""); if (!string.IsNullOrEmpty(s)) ids.Add(s); }
+            foreach (var id in ids)
+            {
+                object raw;
+                if (!_objectCache.TryGetValue(id, out raw)) throw new InvalidOperationException("Text " + id + " not found in object cache (call alphacam_text action:list first)");
+                list.Add(new KeyValuePair<string, object>(id, raw));
+            }
+            if (list.Count == 0 && GetBool(prms, "selected", false))
+            {
+                dynamic texts = drw.Text;
+                int c = 0; try { c = (int)texts.Count; } catch { }
+                for (int i = 1; i <= c; i++)
+                {
+                    dynamic t = texts.Item(i);
+                    bool sel = false; try { sel = (bool)t.Selected; } catch { }
+                    if (sel) list.Add(new KeyValuePair<string, object>(StoreObject(t), (object)t));
+                }
+            }
+            if (list.Count == 0 && required) throw new ArgumentException("Pass textId / textIds (from action:list or create) or selected:true");
+            return list;
+        }
+
+        private static string TextContent(dynamic t)
+        {
+            var lines = new List<string>();
+            try
+            {
+                dynamic ls = t.Lines;
+                int c = (int)ls.Count;
+                for (int i = 1; i <= c; i++) { try { lines.Add((string)ls.Item(i).Text); } catch { lines.Add(""); } }
+            }
+            catch { }
+            return string.Join("\n", lines);
+        }
+
+        private static string JustifyName(int j)
+        {
+            switch (j) { case 0: return "left"; case 1: return "center"; case 2: return "right"; case 3: return "scaled"; default: return j.ToString(); }
+        }
+
+        private static int JustifyCode(string s)
+        {
+            switch ((s ?? "").ToLowerInvariant())
+            {
+                case "left": return 0; case "center": case "centre": return 1; case "right": return 2; case "scaled": return 3;
+                default: throw new ArgumentException("justify must be left/center/right/scaled");
+            }
+        }
+
+        private Dictionary<string, object> DescribeText(string id, dynamic t)
+        {
+            var d = new Dictionary<string, object> { ["textId"] = id, ["text"] = TextContent(t) };
+            try { d["x"] = (double)t.LocationX; d["y"] = (double)t.LocationY; } catch { }
+            try { d["height"] = (double)t.Height; } catch { }
+            try { d["font"] = (string)t.Font; } catch { }
+            try { d["rotation"] = (double)t.Rotation; } catch { }
+            try { d["justify"] = JustifyName((int)t.Justify); } catch { }
+            try { d["bold"] = (bool)t.Bold; d["italic"] = (bool)t.Italic; } catch { }
+            try { d["layer"] = (string)t.GetLayer().Name; } catch { }
+            try { d["selected"] = (bool)t.Selected; d["visible"] = (bool)t.Visible; } catch { }
+            try { d["bounds"] = new Dictionary<string, object> { ["minX"] = Math.Round((double)t.MinXL, 4), ["minY"] = Math.Round((double)t.MinYL, 4), ["maxX"] = Math.Round((double)t.MaxXL, 4), ["maxY"] = Math.Round((double)t.MaxYL, 4) }; } catch { }
+            try { d["isDimension"] = (bool)t.IsDimension; } catch { }
+            return d;
+        }
+
+        // Apply the optional style/placement params to a Text object.
+        private void ApplyTextProps(dynamic drw, dynamic t, Dictionary<string, object> prms, List<string> applied)
+        {
+            if (prms.ContainsKey("font")) { var f = GetString(prms, "font", ""); if (!string.IsNullOrEmpty(f)) { t.Font = f; applied.Add("font"); } }
+            if (prms.ContainsKey("height")) { t.Height = GetDouble(prms, "height"); applied.Add("height"); }
+            if (prms.ContainsKey("x")) { t.LocationX = GetDouble(prms, "x"); applied.Add("x"); }
+            if (prms.ContainsKey("y")) { t.LocationY = GetDouble(prms, "y"); applied.Add("y"); }
+            if (prms.ContainsKey("rotation")) { t.Rotation = GetDouble(prms, "rotation"); applied.Add("rotation"); }
+            if (prms.ContainsKey("justify")) { t.Justify = JustifyCode(GetString(prms, "justify", "left")); applied.Add("justify"); }
+            if (prms.ContainsKey("bold")) { t.Bold = GetBool(prms, "bold", false); applied.Add("bold"); }
+            if (prms.ContainsKey("italic")) { t.Italic = GetBool(prms, "italic", false); applied.Add("italic"); }
+            if (prms.ContainsKey("lineSpacing")) { t.LineSpacing = GetDouble(prms, "lineSpacing"); applied.Add("lineSpacing"); }
+            if (prms.ContainsKey("spacing")) { t.Spacing = GetDouble(prms, "spacing"); applied.Add("spacing"); }
+            if (prms.ContainsKey("widthScale")) { t.CharacterWidthScale = GetDouble(prms, "widthScale"); applied.Add("widthScale"); }
+            if (prms.ContainsKey("layer"))
+            {
+                var ln = GetString(prms, "layer", "");
+                if (!string.IsNullOrEmpty(ln))
+                {
+                    dynamic layer = FindLayerByName(drw, ln);
+                    if (layer == null) layer = drw.CreateLayer(ln);
+                    t.SetLayer(layer); applied.Add("layer");
+                }
+            }
+        }
+
+        private Dictionary<string, object> TextTool(Dictionary<string, object> prms)
+        {
+            dynamic drw = _app.ActiveDrawing;
+            var action = GetString(prms, "action", "create").ToLowerInvariant();
+            switch (action)
+            {
+                case "list":
+                {
+                    dynamic texts = drw.Text;
+                    int c = 0; try { c = (int)texts.Count; } catch { }
+                    string layerFilter = prms.ContainsKey("layer") ? GetString(prms, "layer", "") : null;
+                    bool selectedOnly = GetBool(prms, "selected", false);
+                    var items = new List<Dictionary<string, object>>();
+                    for (int i = 1; i <= c; i++)
+                    {
+                        dynamic t = texts.Item(i);
+                        if (selectedOnly) { bool sel = false; try { sel = (bool)t.Selected; } catch { } if (!sel) continue; }
+                        if (!string.IsNullOrEmpty(layerFilter))
+                        {
+                            string ln = ""; try { ln = (string)t.GetLayer().Name; } catch { }
+                            if (!string.Equals(ln, layerFilter, StringComparison.OrdinalIgnoreCase)) continue;
+                        }
+                        items.Add(DescribeText(StoreObject(t), t));
+                    }
+                    return new Dictionary<string, object> { ["totalCount"] = c, ["texts"] = items };
+                }
+
+                case "create":
+                {
+                    var text = GetString(prms, "text");
+                    var lines = text.Replace("\r\n", "\n").Split('\n');
+                    double height = GetDouble(prms, "height");
+                    if (prms.ContainsKey("font")) { var f = GetString(prms, "font", ""); if (!string.IsNullOrEmpty(f)) { try { drw.Font = f; } catch { } } }
+                    dynamic t;
+                    if (prms.ContainsKey("pathGeometryId"))
+                    {
+                        object raw;
+                        var pid = GetString(prms, "pathGeometryId");
+                        if (!_objectCache.TryGetValue(pid, out raw)) throw new InvalidOperationException("Geometry " + pid + " not found in object cache");
+                        int just = prms.ContainsKey("justify") ? JustifyCode(GetString(prms, "justify", "left")) : 0;
+                        t = drw.CreateTextAlongPath2(text, raw, just, height, GetDouble(prms, "characterGap", 0));
+                    }
+                    else
+                    {
+                        t = drw.CreateText2(lines[0], GetDouble(prms, "x"), GetDouble(prms, "y"), height);
+                        for (int i = 1; i < lines.Length; i++) t.AddText(lines[i]);
+                    }
+                    var applied = new List<string>();
+                    var styleOnly = new Dictionary<string, object>(prms);
+                    styleOnly.Remove("x"); styleOnly.Remove("y"); styleOnly.Remove("height"); styleOnly.Remove("font");
+                    if (prms.ContainsKey("font")) { try { t.Font = GetString(prms, "font", ""); } catch { } }
+                    ApplyTextProps(drw, t, styleOnly, applied);
+                    try { t.Redraw(); } catch { }
+                    var id = StoreObject(t);
+                    var res = DescribeText(id, t);
+                    res["created"] = true;
+                    return res;
+                }
+
+                case "edit":
+                {
+                    var targets = ResolveTexts(drw, prms, true);
+                    var results = new List<Dictionary<string, object>>();
+                    foreach (var kv in targets)
+                    {
+                        dynamic t = kv.Value;
+                        var applied = new List<string>();
+                        string outId = kv.Key;
+                        try { t.SaveForUndo(); } catch { }
+                        if (prms.ContainsKey("text"))
+                        {
+                            var lines = GetString(prms, "text").Replace("\r\n", "\n").Split('\n');
+                            dynamic ls = t.Lines;
+                            int existing = 0; try { existing = (int)ls.Count; } catch { }
+                            if (lines.Length >= existing && existing > 0)
+                            {
+                                for (int i = 1; i <= existing; i++) ls.Item(i).Text = lines[i - 1];
+                                for (int i = existing; i < lines.Length; i++) t.AddText(lines[i]);
+                                applied.Add("text");
+                            }
+                            else
+                            {
+                                // Fewer lines than before: no API to remove a line, so recreate with the same properties.
+                                double x = (double)t.LocationX, y = (double)t.LocationY, h = (double)t.Height;
+                                string font = null; try { font = (string)t.Font; } catch { }
+                                double rot = 0; try { rot = (double)t.Rotation; } catch { }
+                                int just = 0; try { just = (int)t.Justify; } catch { }
+                                bool bold = false, italic = false; try { bold = (bool)t.Bold; italic = (bool)t.Italic; } catch { }
+                                dynamic layer = null; try { layer = t.GetLayer(); } catch { }
+                                double lsp = 0, sp = 0; try { lsp = (double)t.LineSpacing; sp = (double)t.Spacing; } catch { }
+                                t.Delete(); RemoveFromCache(kv.Key);
+                                if (!string.IsNullOrEmpty(font)) { try { drw.Font = font; } catch { } }
+                                dynamic nt = drw.CreateText2(lines[0], x, y, h);
+                                for (int i = 1; i < lines.Length; i++) nt.AddText(lines[i]);
+                                try { if (!string.IsNullOrEmpty(font)) nt.Font = font; nt.Rotation = rot; nt.Justify = just; nt.Bold = bold; nt.Italic = italic; if (lsp > 0) nt.LineSpacing = lsp; if (sp > 0) nt.Spacing = sp; } catch { }
+                                try { if (layer != null) nt.SetLayer(layer); } catch { }
+                                t = nt; outId = StoreObject(nt);
+                                applied.Add("text (recreated: fewer lines than before, new textId)");
+                            }
+                        }
+                        ApplyTextProps(drw, t, prms, applied);
+                        try { t.Redraw(); } catch { }
+                        var d = DescribeText(outId, t);
+                        d["applied"] = applied;
+                        if (outId != kv.Key) d["previousTextId"] = kv.Key;
+                        results.Add(d);
+                    }
+                    try { drw.Redraw(); } catch { }
+                    return new Dictionary<string, object> { ["edited"] = results.Count, ["texts"] = results };
+                }
+
+                case "delete":
+                {
+                    var targets = ResolveTexts(drw, prms, true);
+                    int n = 0;
+                    foreach (var kv in targets) { dynamic t = kv.Value; t.Delete(); RemoveFromCache(kv.Key); n++; }
+                    try { drw.Redraw(); } catch { }
+                    return new Dictionary<string, object> { ["deleted"] = n };
+                }
+
+                case "togeometry":
+                case "to_geometry":
+                case "convert":
+                {
+                    var targets = ResolveTexts(drw, prms, true);
+                    var all = new List<string>();
+                    foreach (var kv in targets)
+                    {
+                        dynamic t = kv.Value;
+                        dynamic paths = t.ConvertToGeometry();
+                        RemoveFromCache(kv.Key);
+                        all.AddRange(StorePathsCollection(paths));
+                    }
+                    return new Dictionary<string, object> { ["converted"] = targets.Count, ["geometryIds"] = all, ["note"] = "Text objects were deleted and replaced by line/arc geometry." };
+                }
+
+                default:
+                    throw new ArgumentException("action must be create / list / edit / delete / toGeometry");
             }
         }
 

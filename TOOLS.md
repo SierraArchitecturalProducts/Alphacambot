@@ -6,7 +6,7 @@ ALPHACAM. You don't call these yourself — you ask the agent in normal language
 outside and post it") and it picks the right tools. This page is so you can see
 the whole toolbox, understand what each tool does, and know what's possible.
 
-The bridge exposes **71 tools**: 67 for CAD/CAM work, plus four utilities
+The bridge exposes **73 tools**: 69 for CAD/CAM work, plus four utilities
 (connection status, API help, and the two preference tools). They're grouped
 below the way you'd actually use them, roughly in the order of a job.
 
@@ -61,7 +61,8 @@ below the way you'd actually use them, roughly in the order of a job.
 | `alphacam_create_line` | A single straight line. |
 | `alphacam_create_polygon` | A regular polygon (hexagon, octagon, …). |
 | `alphacam_create_ellipse` | An ellipse. |
-| `alphacam_create_text` | Text turned into cuttable line/arc geometry. |
+| `alphacam_create_text` | Text turned into cuttable line/arc geometry (for engraving or cutting letters). |
+| `alphacam_text` | Real, editable **text objects** — create, list, edit, delete, or convert to geometry. Use this for labels, part numbers, notes and part maps: a person can still edit them in ALPHACAM afterwards. |
 | `alphacam_create_2d_geometry` | Any shape built from connected lines and arcs — the workhorse for arbitrary profiles (this is how the demo involute gear was drawn). |
 | `alphacam_list_geometries` | List every shape, with which ones are selected. |
 | `alphacam_get_geometry_info` | Details on one shape: layer, size, length, open/closed. |
@@ -78,6 +79,7 @@ below the way you'd actually use them, roughly in the order of a job.
 | `alphacam_reverse_geometry` | Flip a path's cut direction. |
 | `alphacam_set_start_point` | Choose where the tool plunges on a closed shape. |
 | `alphacam_delete_geometry` | Delete a shape. |
+| `alphacam_check_geometry` | **Lint** shapes for things that break machining styles or halt a CNC: enormous-radius arcs (I/J overflow, arc-radius alarms), micro elements, joint gaps, self-intersecting hooks/spikes, nearly-closed paths, non-zero Z, stacked duplicates. One call scans a layer, a selection, a sheet rectangle or the whole drawing and returns counts plus the worst offenders with coordinates; `fix:true` rebuilds only the flagged shapes in place (same ids, layers, tool sides). Run it after a DXF/font import and before saving parts or nesting. |
 
 ## Layers & work planes
 

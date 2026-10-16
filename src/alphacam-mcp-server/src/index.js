@@ -101,6 +101,8 @@ async function ensureConnected() {
 // user physically picking geometries in Alphacam, so it gets a long leash.
 const METHOD_TIMEOUTS = {
   'alphacam.user_select': 5 * 60 * 1000,
+  // Whole-drawing element scans (846 geometries took seconds; allow for large nests).
+  'alphacam.check_geometry': 5 * 60 * 1000,
   // DoNest computes for a while (>30 s observed on a 2-part/14-piece nest).
   'alphacam.nest': 10 * 60 * 1000,
   // These accept interactive:true (user picks geometries in Alphacam).
